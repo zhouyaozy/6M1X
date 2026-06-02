@@ -1,0 +1,94 @@
+diff --git a/analytics/lib/counts.py b/analytics/lib/counts.py
+index d44c670691..3f9a9a569d 100644
+--- a/analytics/lib/counts.py
++++ b/analytics/lib/counts.py
+@@ -542,6 +542,32 @@ def count_upload_space_used_by_realm_query(realm: Realm | None) -> QueryFn:
+     ).format(**kwargs, realm_clause=realm_clause)
+ 
+ 
++def count_attachments_per_day_by_realm_query(realm: Realm | None) -> QueryFn:
++    if realm is None:
++        realm_clause: Composable = SQL("")
++    else:
++        realm_clause = SQL("zerver_attachment.realm_id = {} AND").format(Literal(realm.id))
++
++    return lambda kwargs: SQL(
++        """
++            INSERT INTO analytics_realmcount (realm_id, property, end_time, value)
++            SELECT
++                zerver_attachment.realm_id,
++                %(property)s,
++                %(time_end)s,
++                COUNT(*)
++            FROM
++                zerver_attachment
++            WHERE
++                {realm_clause}
++                zerver_attachment.create_time >= %(time_start)s AND
++                zerver_attachment.create_time < %(time_end)s
++            GROUP BY
++                zerver_attachment.realm_id
++        """
++    ).format(**kwargs, realm_clause=realm_clause)
++
++
+ def do_pull_minutes_active(
+     property: str, start_time: datetime, end_time: datetime, realm: Realm | None = None
+ ) -> int:
+@@ -894,6 +920,11 @@ def get_count_stats(realm: Realm | None = None) -> dict[str, CountStat]:
+             sql_data_collector(RealmCount, count_upload_space_used_by_realm_query(realm), None),
+             CountStat.DAY,
+         ),
++        CountStat(
++            "uploads_per_day:day",
++            sql_data_collector(RealmCount, count_attachments_per_day_by_realm_query(realm), None),
++            CountStat.DAY,
++        ),
+         # Messages read stats.  messages_read::hour is the total
+         # number of messages read, whereas
+         # messages_read_interactions::hour tries to count the total
+diff --git a/analytics/tests/test_counts.py b/analytics/tests/test_counts.py
+index 21fbe67e55..8b1932ed3a 100644
+--- a/analytics/tests/test_counts.py
++++ b/analytics/tests/test_counts.py
+@@ -556,6 +556,40 @@ class TestCountStats(AnalyticsTestCase):
+             ],
+         )
+ 
++    def test_uploads_per_day(self) -> None:
++        stat = COUNT_STATS["uploads_per_day:day"]
++        self.current_property = stat.property
++
++        user1 = self.create_user()
++        user2 = self.create_user()
++        user_second_realm = self.create_user(realm=self.second_realm)
++
++        self.create_attachment(user1, "file1", 100, self.TIME_LAST_HOUR, "text/plain")
++        self.create_attachment(user2, "file2", 200, self.TIME_LAST_HOUR, "text/plain")
++        self.create_attachment(user_second_realm, "file3", 10, self.TIME_LAST_HOUR, "text/plain")
++
++        do_fill_count_stat_at_hour(stat, self.TIME_ZERO)
++
++        self.assertTableState(
++            RealmCount,
++            ["value", "subgroup", "realm"],
++            [[2, None, self.default_realm], [1, None, self.second_realm]],
++        )
++
++        self.create_attachment(user1, "file4", 50, self.TIME_ZERO, "text/plain")
++        do_fill_count_stat_at_hour(stat, self.TIME_ZERO + self.DAY)
++
++        self.assertTableState(
++            RealmCount,
++            ["value", "subgroup", "realm", "end_time"],
++            [
++                [2, None, self.default_realm, self.TIME_ZERO],
++                [1, None, self.second_realm, self.TIME_ZERO],
++                [1, None, self.default_realm, self.TIME_ZERO + self.DAY],
++                [0, None, self.second_realm, self.TIME_ZERO + self.DAY],
++            ],
++        )
++
+     def test_messages_sent_by_is_bot(self) -> None:
+         stat = COUNT_STATS["messages_sent:is_bot:hour"]
+         self.current_property = stat.property

@@ -542,6 +542,32 @@ def count_upload_space_used_by_realm_query(realm: Realm | None) -> QueryFn:
     ).format(**kwargs, realm_clause=realm_clause)
 
 
+def count_attachments_per_day_by_realm_query(realm: Realm | None) -> QueryFn:
+    if realm is None:
+        realm_clause: Composable = SQL("")
+    else:
+        realm_clause = SQL("zerver_attachment.realm_id = {} AND").format(Literal(realm.id))
+
+    return lambda kwargs: SQL(
+        """
+            INSERT INTO analytics_realmcount (realm_id, property, end_time, value)
+            SELECT
+                zerver_attachment.realm_id,
+                %(property)s,
+                %(time_end)s,
+                COUNT(*)
+            FROM
+                zerver_attachment
+            WHERE
+                {realm_clause}
+                zerver_attachment.create_time >= %(time_start)s AND
+                zerver_attachment.create_time < %(time_end)s
+            GROUP BY
+                zerver_attachment.realm_id
+        """
+    ).format(**kwargs, realm_clause=realm_clause)
+
+
 def do_pull_minutes_active(
     property: str, start_time: datetime, end_time: datetime, realm: Realm | None = None
 ) -> int:
@@ -892,6 +918,11 @@ def get_count_stats(realm: Realm | None = None) -> dict[str, CountStat]:
         CountStat(
             "upload_quota_used_bytes::day",
             sql_data_collector(RealmCount, count_upload_space_used_by_realm_query(realm), None),
+            CountStat.DAY,
+        ),
+        CountStat(
+            "uploads_per_day:day",
+            sql_data_collector(RealmCount, count_attachments_per_day_by_realm_query(realm), None),
             CountStat.DAY,
         ),
         # Messages read stats.  messages_read::hour is the total

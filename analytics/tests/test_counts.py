@@ -556,6 +556,40 @@ class TestCountStats(AnalyticsTestCase):
             ],
         )
 
+    def test_uploads_per_day(self) -> None:
+        stat = COUNT_STATS["uploads_per_day:day"]
+        self.current_property = stat.property
+
+        user1 = self.create_user()
+        user2 = self.create_user()
+        user_second_realm = self.create_user(realm=self.second_realm)
+
+        self.create_attachment(user1, "file1", 100, self.TIME_LAST_HOUR, "text/plain")
+        self.create_attachment(user2, "file2", 200, self.TIME_LAST_HOUR, "text/plain")
+        self.create_attachment(user_second_realm, "file3", 10, self.TIME_LAST_HOUR, "text/plain")
+
+        do_fill_count_stat_at_hour(stat, self.TIME_ZERO)
+
+        self.assertTableState(
+            RealmCount,
+            ["value", "subgroup", "realm"],
+            [[2, None, self.default_realm], [1, None, self.second_realm]],
+        )
+
+        self.create_attachment(user1, "file4", 50, self.TIME_ZERO, "text/plain")
+        do_fill_count_stat_at_hour(stat, self.TIME_ZERO + self.DAY)
+
+        self.assertTableState(
+            RealmCount,
+            ["value", "subgroup", "realm", "end_time"],
+            [
+                [2, None, self.default_realm, self.TIME_ZERO],
+                [1, None, self.second_realm, self.TIME_ZERO],
+                [1, None, self.default_realm, self.TIME_ZERO + self.DAY],
+                [0, None, self.second_realm, self.TIME_ZERO + self.DAY],
+            ],
+        )
+
     def test_messages_sent_by_is_bot(self) -> None:
         stat = COUNT_STATS["messages_sent:is_bot:hour"]
         self.current_property = stat.property
