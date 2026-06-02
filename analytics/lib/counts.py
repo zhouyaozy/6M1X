@@ -2,8 +2,9 @@ import logging
 import time
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TypeAlias, Union
+from typing import Literal, TypeAlias, Union
 
 from django.conf import settings
 from django.db import connection, models
@@ -20,7 +21,8 @@ from analytics.models import (
     UserCount,
     installation_epoch,
 )
-from zerver.lib.timestamp import ceiling_to_day, ceiling_to_hour, floor_to_hour, verify_UTC
+from zerver.lib.timestamp import ceiling_to_day, ceiling_to_hour, floor_to_day, floor_to_hour, verify_UTC
+from zerver.lib.timestamp import TimeZoneNotUTCError
 from zerver.models import Message, Realm, Stream, UserActivityInterval, UserProfile
 from zerver.models.realm_audit_logs import AuditLogEventType
 
@@ -1024,3 +1026,147 @@ if settings.ZILENCER_ENABLED:
 ALL_COUNT_STATS = OrderedDict(
     list(COUNT_STATS.items()) + list(REMOTE_INSTALLATION_COUNT_STATS.items())
 )
+
+
+@dataclass
+class AnalyticsStateCheckResult:
+    status: Literal["ok", "warning", "critical", "unknown"]
+    message: str
+
+
+def check_analytics_fill_state() -> AnalyticsStateCheckResult:
+    if not Realm.objects.exists():
+        return AnalyticsStateCheckResult(
+            status="ok", message="No realms exist, so not checking FillState."
+        )
+
+    warning_unfilled_properties = []
+    critical_unfilled_properties = []
+    for property, stat in ALL_COUNT_STATS.items():
+        last_fill = stat.last_successful_fill()
+        if last_fill is None:
+            last_fill = installation_epoch()
+        try:
+            verify_UTC(last_fill)
+        except TimeZoneNotUTCError:
+            return AnalyticsStateCheckResult(
+                status="critical", message=f"FillState not in UTC for {property}"
+            )
+
+        if stat.frequency == CountStat.DAY:
+            floor_function = floor_to_day
+            warning_threshold = timedelta(hours=26)
+            critical_threshold = timedelta(hours=50)
+        else:  # CountStat.HOUR
+            floor_function = floor_to_hour
+            warning_threshold = timedelta(minutes=90)
+            critical_threshold = timedelta(minutes=150)
+
+        if floor_function(last_fill) != last_fill:
+            return AnalyticsStateCheckResult(
+                status="critical",
+                message=f"FillState not on {stat.frequency} boundary for {property}",
+            )
+
+        time_to_last_fill = timezone_now() - last_fill
+        if time_to_last_fill > critical_threshold:
+            critical_unfilled_properties.append(property)
+        elif time_to_last_fill > warning_threshold:
+            warning_unfilled_properties.append(property)
+
+    if len(critical_unfilled_properties) == 0 and len(warning_unfilled_properties) == 0:
+        return AnalyticsStateCheckResult(status="ok", message="FillState looks fine.")
+    if len(critical_unfilled_properties) == 0:
+        return AnalyticsStateCheckResult(
+            status="warning",
+            message="Missed filling {} once.".format(
+                ", ".join(warning_unfilled_properties),
+            ),
+        )
+    return AnalyticsStateCheckResult(
+        status="critical",
+        message="Missed filling {} once. Missed filling {} at least twice.".format(
+            ", ".join(warning_unfilled_properties),
+            ", ".join(critical_unfilled_properties),
+        ),
+    )
+
+
+def get_unfilled_properties() -> dict[str, list[str]]:
+    warning_unfilled = []
+    critical_unfilled = []
+    for property, stat in ALL_COUNT_STATS.items():
+        last_fill = stat.last_successful_fill()
+        if last_fill is None:
+            last_fill = installation_epoch()
+
+        if stat.frequency == CountStat.DAY:
+            floor_function = floor_to_day
+            warning_threshold = timedelta(hours=26)
+            critical_threshold = timedelta(hours=50)
+        else:  # CountStat.HOUR
+            floor_function = floor_to_hour
+            warning_threshold = timedelta(minutes=90)
+            critical_threshold = timedelta(minutes=150)
+
+        time_to_last_fill = timezone_now() - last_fill
+        if time_to_last_fill > critical_threshold:
+            critical_unfilled.append(property)
+        elif time_to_last_fill > warning_threshold:
+            warning_unfilled.append(property)
+
+    return {
+        "warning": warning_unfilled,
+        "critical": critical_unfilled,
+    }
+
+
+def is_property_filling_delayed(property: str) -> bool:
+    if property not in ALL_COUNT_STATS:
+        return False
+    stat = ALL_COUNT_STATS[property]
+    last_fill = stat.last_successful_fill()
+    if last_fill is None:
+        last_fill = installation_epoch()
+
+    if stat.frequency == CountStat.DAY:
+        warning_threshold = timedelta(hours=26)
+    else:  # CountStat.HOUR
+        warning_threshold = timedelta(minutes=90)
+
+    return (timezone_now() - last_fill) > warning_threshold
+
+
+def get_property_last_fill_status(property: str) -> dict[str, str | timedelta | None]:
+    if property not in ALL_COUNT_STATS:
+        return {"error": f"Unknown property: {property}"}
+
+    stat = ALL_COUNT_STATS[property]
+    last_fill = stat.last_successful_fill()
+    if last_fill is None:
+        last_fill = installation_epoch()
+
+    time_since_fill = timezone_now() - last_fill
+
+    if stat.frequency == CountStat.DAY:
+        warning_threshold = timedelta(hours=26)
+        critical_threshold = timedelta(hours=50)
+    else:  # CountStat.HOUR
+        warning_threshold = timedelta(minutes=90)
+        critical_threshold = timedelta(minutes=150)
+
+    if time_since_fill > critical_threshold:
+        status = "critical"
+    elif time_since_fill > warning_threshold:
+        status = "warning"
+    else:
+        status = "ok"
+
+    return {
+        "property": property,
+        "frequency": stat.frequency,
+        "last_fill": last_fill,
+        "time_since_fill": time_since_fill,
+        "status": status,
+    }
+
