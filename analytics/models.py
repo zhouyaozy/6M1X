@@ -1,4 +1,5 @@
 from datetime import datetime
+from functools import lru_cache
 
 from django.db import models
 from django.db.models import Q, UniqueConstraint
@@ -10,7 +11,7 @@ from zerver.models import Realm, Stream, UserProfile
 
 class FillState(models.Model):
     property = models.CharField(max_length=40, unique=True)
-    end_time = models.DateTimeField()
+    end_time = models.DateTimeField(db_index=True)
 
     # Valid states are {DONE, STARTED}
     DONE = 1
@@ -24,6 +25,7 @@ class FillState(models.Model):
 
 # The earliest/starting end_time in FillState
 # We assume there is at least one realm
+@lru_cache(None)
 def installation_epoch() -> datetime:
     earliest_realm_creation = Realm.objects.aggregate(models.Min("date_created"))[
         "date_created__min"
@@ -58,6 +60,12 @@ class InstallationCount(BaseCount):
                 condition=Q(subgroup__isnull=True),
                 name="unique_installation_count_null_subgroup",
             ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["property", "end_time"],
+                name="analytics_installationcount_property_end_time_idx",
+            )
         ]
 
     @override
