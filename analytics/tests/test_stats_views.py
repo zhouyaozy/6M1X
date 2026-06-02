@@ -8,6 +8,7 @@ from analytics.lib.time_utils import time_range
 from analytics.models import FillState, RealmCount, StreamCount, UserCount
 from analytics.views.stats import rewrite_client_arrays, sort_by_totals, sort_client_labels
 from zerver.lib.test_classes import ZulipTestCase
+from zerver.lib.test_helpers import queries_captured
 from zerver.lib.timestamp import ceiling_to_day, ceiling_to_hour, datetime_to_timestamp
 from zerver.models import Client
 from zerver.models.realms import get_realm
@@ -86,6 +87,12 @@ class TestGetChartData(ZulipTestCase):
     def data(self, i: int) -> list[int]:
         return [0, 0, i, 0]
 
+    def get_chart_data_query_count(self, chart_name: str) -> tuple[int, dict[str, object]]:
+        with queries_captured() as queries:
+            result = self.client_get("/json/analytics/chart_data", {"chart_name": chart_name})
+            data = self.assert_json_success(result)
+        return len(queries), data
+
     def insert_data(
         self, stat: CountStat, realm_subgroups: list[str | None], user_subgroups: list[str]
     ) -> None:
@@ -154,6 +161,57 @@ class TestGetChartData(ZulipTestCase):
                 "result": "success",
             },
         )
+
+    def test_number_of_humans_query_count_does_not_scale_with_time_range(self) -> None:
+        active_users_stat = COUNT_STATS["realm_active_humans::day"]
+        day_actives_stat = COUNT_STATS["1day_actives::day"]
+        audit_stat = COUNT_STATS["active_users_audit:is_bot:day"]
+        self.insert_data(active_users_stat, [None], [])
+        self.insert_data(day_actives_stat, [None], [])
+        self.insert_data(audit_stat, ["false"], [])
+        baseline_query_count, baseline_data = self.get_chart_data_query_count("number_of_humans")
+        self.assertEqual(len(baseline_data["end_times"]), len(self.end_times_day))
+
+        additional_end_times = [self.end_times_day[-1] + timedelta(days=i) for i in range(1, 25)]
+        RealmCount.objects.bulk_create(
+            [
+                RealmCount(
+                    property=active_users_stat.property,
+                    subgroup=None,
+                    end_time=end_time,
+                    value=500 + i,
+                    realm=self.realm,
+                )
+                for i, end_time in enumerate(additional_end_times)
+            ]
+            + [
+                RealmCount(
+                    property=day_actives_stat.property,
+                    subgroup=None,
+                    end_time=end_time,
+                    value=600 + i,
+                    realm=self.realm,
+                )
+                for i, end_time in enumerate(additional_end_times)
+            ]
+            + [
+                RealmCount(
+                    property=audit_stat.property,
+                    subgroup="false",
+                    end_time=end_time,
+                    value=700 + i,
+                    realm=self.realm,
+                )
+                for i, end_time in enumerate(additional_end_times)
+            ]
+        )
+        for stat in [active_users_stat, day_actives_stat, audit_stat]:
+            FillState.objects.filter(property=stat.property).update(end_time=additional_end_times[-1])
+
+        expanded_query_count, expanded_data = self.get_chart_data_query_count("number_of_humans")
+
+        self.assertEqual(expanded_query_count, baseline_query_count)
+        self.assertGreater(len(expanded_data["end_times"]), len(baseline_data["end_times"]))
 
     def test_messages_sent_over_time(self) -> None:
         stat = COUNT_STATS["messages_sent:is_bot:hour"]
@@ -243,6 +301,49 @@ class TestGetChartData(ZulipTestCase):
                 "result": "success",
             },
         )
+
+    def test_messages_sent_by_client_query_count_does_not_scale_with_clients(self) -> None:
+        stat = COUNT_STATS["messages_sent:client:day"]
+        baseline_clients = [Client.objects.create(name=f"baseline client {i}") for i in range(2)]
+        self.insert_data(
+            stat,
+            [str(baseline_clients[0].id)],
+            [str(baseline_clients[1].id)],
+        )
+        baseline_query_count, baseline_data = self.get_chart_data_query_count(
+            "messages_sent_by_client"
+        )
+        self.assertEqual(len(baseline_data["display_order"]), 2)
+
+        additional_clients = [Client.objects.create(name=f"extra client {i}") for i in range(25)]
+        insert_time = self.end_times_day[2]
+        RealmCount.objects.bulk_create(
+            RealmCount(
+                property=stat.property,
+                subgroup=str(client.id),
+                end_time=insert_time,
+                value=300 + i,
+                realm=self.realm,
+            )
+            for i, client in enumerate(additional_clients)
+        )
+        UserCount.objects.bulk_create(
+            UserCount(
+                property=stat.property,
+                subgroup=str(client.id),
+                end_time=insert_time,
+                value=400 + i,
+                realm=self.realm,
+                user=self.user,
+            )
+            for i, client in enumerate(additional_clients)
+        )
+        expanded_query_count, expanded_data = self.get_chart_data_query_count(
+            "messages_sent_by_client"
+        )
+
+        self.assertEqual(expanded_query_count, baseline_query_count)
+        self.assertGreater(len(expanded_data["display_order"]), len(baseline_data["display_order"]))
 
     def test_messages_read_over_time(self) -> None:
         stat = COUNT_STATS["messages_read::hour"]
