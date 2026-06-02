@@ -1,0 +1,308 @@
+diff --git a/analytics/tests/test_stats_views.py b/analytics/tests/test_stats_views.py
+index 68f6190f09..ce7661ab0b 100644
+--- a/analytics/tests/test_stats_views.py
++++ b/analytics/tests/test_stats_views.py
+@@ -6,7 +6,12 @@ from typing_extensions import override
+ from analytics.lib.counts import COUNT_STATS, CountStat
+ from analytics.lib.time_utils import time_range
+ from analytics.models import FillState, RealmCount, StreamCount, UserCount
+-from analytics.views.stats import rewrite_client_arrays, sort_by_totals, sort_client_labels
++from analytics.views.stats import (
++    get_time_series_by_subgroup,
++    rewrite_client_arrays,
++    sort_by_totals,
++    sort_client_labels,
++)
+ from zerver.lib.test_classes import ZulipTestCase
+ from zerver.lib.timestamp import ceiling_to_day, ceiling_to_hour, datetime_to_timestamp
+ from zerver.models import Client
+@@ -687,3 +692,289 @@ class TestMapArrays(ZulipTestCase):
+                 "Terminal app": [9, 10, 11],
+             },
+         )
++
++
++class TestStatsPerformance(ZulipTestCase):
++    @override
++    def setUp(self) -> None:
++        super().setUp()
++        self.realm = get_realm("zulip")
++        self.user = self.example_user("hamlet")
++        self.stream_id = self.get_stream_id(self.get_streams(self.user)[0])
++        self.login_user(self.user)
++        self.end_times_hour = [
++            ceiling_to_hour(self.realm.date_created) + timedelta(hours=i) for i in range(4)
++        ]
++        self.end_times_day = [
++            ceiling_to_day(self.realm.date_created) + timedelta(days=i) for i in range(4)
++        ]
++
++    def insert_data(
++        self, stat: CountStat, realm_subgroups: list[str | None], user_subgroups: list[str]
++    ) -> None:
++        if stat.frequency == CountStat.HOUR:
++            insert_time = self.end_times_hour[2]
++            fill_time = self.end_times_hour[-1]
++        if stat.frequency == CountStat.DAY:
++            insert_time = self.end_times_day[2]
++            fill_time = self.end_times_day[-1]
++
++        RealmCount.objects.bulk_create(
++            RealmCount(
++                property=stat.property,
++                subgroup=subgroup,
++                end_time=insert_time,
++                value=100 + i,
++                realm=self.realm,
++            )
++            for i, subgroup in enumerate(realm_subgroups)
++        )
++        UserCount.objects.bulk_create(
++            UserCount(
++                property=stat.property,
++                subgroup=subgroup,
++                end_time=insert_time,
++                value=200 + i,
++                realm=self.realm,
++                user=self.user,
++            )
++            for i, subgroup in enumerate(user_subgroups)
++        )
++        StreamCount.objects.bulk_create(
++            StreamCount(
++                property=stat.property,
++                subgroup=subgroup,
++                end_time=insert_time,
++                value=100 + i,
++                stream_id=self.stream_id,
++                realm=self.realm,
++            )
++            for i, subgroup in enumerate(realm_subgroups)
++        )
++        FillState.objects.create(property=stat.property, end_time=fill_time, state=FillState.DONE)
++
++    def test_get_time_series_by_subgroup_query_count(self) -> None:
++        stat = COUNT_STATS["messages_sent:is_bot:hour"]
++        self.insert_data(stat, ["true", "false"], ["false"])
++        subgroup_to_label = {"false": "human", "true": "bot"}
++        with self.assert_database_query_count(1):
++            get_time_series_by_subgroup(
++                stat,
++                RealmCount,
++                self.realm.id,
++                self.end_times_hour,
++                subgroup_to_label,
++                True,
++            )
++
++    def test_get_time_series_by_subgroup_query_count_with_many_subgroups(self) -> None:
++        stat = COUNT_STATS["messages_sent:is_bot:hour"]
++        num_subgroups = 20
++        realm_subgroups = [f"subgroup_{i}" for i in range(num_subgroups)]
++        RealmCount.objects.bulk_create(
++            RealmCount(
++                property=stat.property,
++                subgroup=subgroup,
++                end_time=self.end_times_hour[2],
++                value=i,
++                realm=self.realm,
++            )
++            for i, subgroup in enumerate(realm_subgroups)
++        )
++        FillState.objects.create(
++            property=stat.property, end_time=self.end_times_hour[-1], state=FillState.DONE
++        )
++        subgroup_to_label = {s: s for s in realm_subgroups}
++        with self.assert_database_query_count(1):
++            get_time_series_by_subgroup(
++                stat,
++                RealmCount,
++                self.realm.id,
++                self.end_times_hour,
++                subgroup_to_label,
++                True,
++            )
++
++    def test_get_time_series_by_subgroup_query_count_with_many_end_times(self) -> None:
++        stat = COUNT_STATS["1day_actives::day"]
++        end_times = [
++            ceiling_to_day(self.realm.date_created) + timedelta(days=i) for i in range(365)
++        ]
++        RealmCount.objects.bulk_create(
++            RealmCount(
++                property=stat.property,
++                subgroup=None,
++                end_time=end_time,
++                value=i,
++                realm=self.realm,
++            )
++            for i, end_time in enumerate(end_times)
++        )
++        FillState.objects.create(
++            property=stat.property, end_time=end_times[-1], state=FillState.DONE
++        )
++        with self.assert_database_query_count(1):
++            get_time_series_by_subgroup(
++                stat,
++                RealmCount,
++                self.realm.id,
++                end_times,
++                {None: "active"},
++                True,
++            )
++
++    def test_chart_data_number_of_humans_query_count(self) -> None:
++        stat = COUNT_STATS["realm_active_humans::day"]
++        self.insert_data(stat, [None], [])
++        stat = COUNT_STATS["1day_actives::day"]
++        self.insert_data(stat, [None], [])
++        stat = COUNT_STATS["active_users_audit:is_bot:day"]
++        self.insert_data(stat, ["false"], [])
++        self.client_get("/json/analytics/chart_data", {"chart_name": "number_of_humans"})
++        with self.assert_database_query_count(6, keep_cache_warm=True):
++            self.client_get("/json/analytics/chart_data", {"chart_name": "number_of_humans"})
++
++    def test_chart_data_messages_sent_over_time_query_count(self) -> None:
++        stat = COUNT_STATS["messages_sent:is_bot:hour"]
++        self.insert_data(stat, ["true", "false"], ["false"])
++        self.client_get(
++            "/json/analytics/chart_data", {"chart_name": "messages_sent_over_time"}
++        )
++        with self.assert_database_query_count(3, keep_cache_warm=True):
++            self.client_get(
++                "/json/analytics/chart_data", {"chart_name": "messages_sent_over_time"}
++            )
++
++    def test_chart_data_messages_sent_by_message_type_query_count(self) -> None:
++        stat = COUNT_STATS["messages_sent:message_type:day"]
++        self.insert_data(
++            stat, ["public_stream", "private_message"], ["public_stream", "private_stream"]
++        )
++        self.client_get(
++            "/json/analytics/chart_data", {"chart_name": "messages_sent_by_message_type"}
++        )
++        with self.assert_database_query_count(3, keep_cache_warm=True):
++            self.client_get(
++                "/json/analytics/chart_data", {"chart_name": "messages_sent_by_message_type"}
++            )
++
++    def test_chart_data_messages_sent_by_client_query_count(self) -> None:
++        stat = COUNT_STATS["messages_sent:client:day"]
++        Client.objects.create(name="client 1")
++        Client.objects.create(name="client 2")
++        self.insert_data(stat, ["1", "2"], ["1"])
++        self.client_get(
++            "/json/analytics/chart_data", {"chart_name": "messages_sent_by_client"}
++        )
++        with self.assert_database_query_count(4, keep_cache_warm=True):
++            self.client_get(
++                "/json/analytics/chart_data", {"chart_name": "messages_sent_by_client"}
++            )
++
++    def test_chart_data_messages_read_over_time_query_count(self) -> None:
++        stat = COUNT_STATS["messages_read::hour"]
++        self.insert_data(stat, [None], [])
++        self.client_get(
++            "/json/analytics/chart_data", {"chart_name": "messages_read_over_time"}
++        )
++        with self.assert_database_query_count(3, keep_cache_warm=True):
++            self.client_get(
++                "/json/analytics/chart_data", {"chart_name": "messages_read_over_time"}
++            )
++
++    def test_chart_data_query_count_does_not_scale_with_data_volume(self) -> None:
++        stat = COUNT_STATS["messages_sent:is_bot:hour"]
++        for i in range(10):
++            RealmCount.objects.create(
++                property=stat.property,
++                subgroup="false",
++                end_time=self.end_times_hour[2] + timedelta(hours=i),
++                value=100 + i,
++                realm=self.realm,
++            )
++            RealmCount.objects.create(
++                property=stat.property,
++                subgroup="true",
++                end_time=self.end_times_hour[2] + timedelta(hours=i),
++                value=200 + i,
++                realm=self.realm,
++            )
++        FillState.objects.create(
++            property=stat.property, end_time=self.end_times_hour[-1], state=FillState.DONE
++        )
++        self.client_get(
++            "/json/analytics/chart_data", {"chart_name": "messages_sent_over_time"}
++        )
++        with self.assert_database_query_count(3, keep_cache_warm=True):
++            self.client_get(
++                "/json/analytics/chart_data", {"chart_name": "messages_sent_over_time"}
++            )
++
++    def test_rewrite_client_arrays_large_input(self) -> None:
++        num_clients = 500
++        num_time_points = 365
++        input_data = {
++            f"client_{i}": [i] * num_time_points for i in range(num_clients)
++        }
++        result = rewrite_client_arrays(input_data)
++        self.assertEqual(len(result), num_clients)
++        for array in result.values():
++            self.assert_length(array, num_time_points)
++
++    def test_rewrite_client_arrays_with_many_collisions(self) -> None:
++        num_variants = 100
++        num_time_points = 365
++        input_data = {
++            f"desktop app {i}.0": [i] * num_time_points for i in range(num_variants)
++        }
++        result = rewrite_client_arrays(input_data)
++        self.assertIn("Old desktop app", result)
++        expected_total = sum(range(num_variants))
++        self.assertEqual(result["Old desktop app"][0], expected_total)
++        self.assert_length(result["Old desktop app"], num_time_points)
++
++    def test_sort_by_totals_large_input(self) -> None:
++        num_entries = 1000
++        num_time_points = 365
++        value_arrays = {
++            f"label_{i}": [i] * num_time_points for i in range(num_entries)
++        }
++        result = sort_by_totals(value_arrays)
++        self.assert_length(result, num_entries)
++        self.assertEqual(result[0], f"label_{num_entries - 1}")
++        self.assertEqual(result[-1], "label_0")
++
++    def test_sort_client_labels_large_input(self) -> None:
++        num_clients = 200
++        data = {
++            "everyone": {f"client_{i}": [num_clients - i] for i in range(num_clients)},
++            "user": {f"client_{i}": [num_clients - i] for i in range(num_clients)},
++        }
++        result = sort_client_labels(data)
++        self.assert_length(result, num_clients)
++        self.assertEqual(result[0], "client_0")
++
++    def test_time_range_large_day_span(self) -> None:
++        start = datetime(2020, 1, 1, tzinfo=timezone.utc)
++        end = datetime(2030, 1, 1, tzinfo=timezone.utc)
++        result = time_range(start, end, CountStat.DAY, None)
++        expected_length = (end - start).days + 1
++        self.assert_length(result, expected_length)
++        self.assertEqual(result[0], start)
++        self.assertEqual(result[-1], end)
++
++    def test_time_range_large_hour_span(self) -> None:
++        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
++        end = datetime(2025, 1, 1, tzinfo=timezone.utc)
++        result = time_range(start, end, CountStat.HOUR, None)
++        expected_length = int((end - start).total_seconds() // 3600) + 1
++        self.assert_length(result, expected_length)
++        self.assertEqual(result[0], start)
++        self.assertEqual(result[-1], end)
++
++    def test_time_range_with_large_min_length(self) -> None:
++        start = datetime(2024, 6, 1, tzinfo=timezone.utc)
++        end = datetime(2024, 6, 2, tzinfo=timezone.utc)
++        result = time_range(start, end, CountStat.DAY, 1000)
++        self.assert_length(result, 1000)
++        self.assertEqual(result[-1], end)
