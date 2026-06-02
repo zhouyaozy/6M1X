@@ -1,0 +1,42 @@
+from analytics.lib.counts import CountStat
+
+
+def generate_expected_fixture_series(
+    *,
+    days: int,
+    business_hours_base: float,
+    non_business_hours_base: float,
+    growth: float = 1,
+    frequency: str = CountStat.DAY,
+    partial_sum: bool = False,
+) -> list[int]:
+    if frequency == CountStat.HOUR:
+        length = days * 24
+        seasonality = [non_business_hours_base] * 24 * 7
+        for day in range(5):
+            for hour in range(8):
+                seasonality[24 * day + hour] = business_hours_base
+    elif frequency == CountStat.DAY:
+        length = days
+        seasonality = [8 * business_hours_base + 16 * non_business_hours_base] * 5 + [
+            24 * non_business_hours_base
+        ] * 2
+    else:
+        raise AssertionError(f"Unknown frequency: {frequency}")
+
+    if length < 2:
+        raise AssertionError(
+            f"Must be generating at least 2 data points. Currently generating {length}"
+        )
+
+    growth_base = growth ** (1.0 / (length - 1))
+    values = [int(seasonality[i % len(seasonality)] * (growth_base**i)) for i in range(length)]
+
+    if partial_sum:
+        for i in range(1, length):
+            values[i] = values[i - 1] + values[i]
+
+    return values
+
+
+__all__ = ["generate_expected_fixture_series"]
