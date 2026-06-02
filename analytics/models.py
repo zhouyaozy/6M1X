@@ -1,4 +1,5 @@
 from datetime import datetime
+from functools import lru_cache
 
 from django.db import models
 from django.db.models import Q, UniqueConstraint
@@ -24,6 +25,7 @@ class FillState(models.Model):
 
 # The earliest/starting end_time in FillState
 # We assume there is at least one realm
+@lru_cache(maxsize=1)
 def installation_epoch() -> datetime:
     earliest_realm_creation = Realm.objects.aggregate(models.Min("date_created"))[
         "date_created__min"
@@ -46,6 +48,7 @@ class BaseCount(models.Model):
 
 class InstallationCount(BaseCount):
     class Meta:
+        db_table = "analytics_installationcount"
         # Handles invalid duplicate InstallationCount data
         constraints = [
             UniqueConstraint(
@@ -59,6 +62,18 @@ class InstallationCount(BaseCount):
                 name="unique_installation_count_null_subgroup",
             ),
         ]
+        # Index for installation-level analytics queries
+        indexes = [
+            models.Index(
+                fields=["property", "end_time"],
+                name="analytics_installationcount_property_end_time_idx",
+            ),
+            models.Index(
+                fields=["property", "subgroup", "end_time"],
+                name="analytics_installationcount_property_subgroup_end_time_idx",
+            ),
+        ]
+        ordering = ["property", "end_time"]
 
     @override
     def __str__(self) -> str:
@@ -69,6 +84,7 @@ class RealmCount(BaseCount):
     realm = models.ForeignKey(Realm, on_delete=models.CASCADE)
 
     class Meta:
+        db_table = "analytics_realmcount"
         # Handles invalid duplicate RealmCount data
         constraints = [
             UniqueConstraint(
@@ -86,8 +102,19 @@ class RealmCount(BaseCount):
             models.Index(
                 fields=["property", "end_time"],
                 name="analytics_realmcount_property_end_time_3b60396b_idx",
-            )
+            ),
+            # Index for queries filtering by realm and property
+            models.Index(
+                fields=["realm", "property", "end_time"],
+                name="analytics_realmcount_realm_property_end_time_idx",
+            ),
+            # Index for aggregation queries grouping by subgroup
+            models.Index(
+                fields=["property", "subgroup", "end_time"],
+                name="analytics_realmcount_property_subgroup_end_time_idx",
+            ),
         ]
+        ordering = ["realm", "property", "end_time"]
 
     @override
     def __str__(self) -> str:
@@ -99,6 +126,7 @@ class UserCount(BaseCount):
     realm = models.ForeignKey(Realm, on_delete=models.CASCADE)
 
     class Meta:
+        db_table = "analytics_usercount"
         # Handles invalid duplicate UserCount data
         constraints = [
             UniqueConstraint(
@@ -118,8 +146,19 @@ class UserCount(BaseCount):
             models.Index(
                 fields=["property", "realm", "end_time"],
                 name="analytics_usercount_property_realm_id_end_time_591dbec1_idx",
-            )
+            ),
+            # Index for queries filtering by user and property
+            models.Index(
+                fields=["user", "property", "end_time"],
+                name="analytics_usercount_user_property_end_time_idx",
+            ),
+            # Index for monthly aggregation queries
+            models.Index(
+                fields=["user", "property", "end_time", "value"],
+                name="analytics_usercount_user_property_end_time_value_idx",
+            ),
         ]
+        ordering = ["user", "property", "end_time"]
 
     @override
     def __str__(self) -> str:
@@ -131,6 +170,7 @@ class StreamCount(BaseCount):
     realm = models.ForeignKey(Realm, on_delete=models.CASCADE)
 
     class Meta:
+        db_table = "analytics_streamcount"
         # Handles invalid duplicate StreamCount data
         constraints = [
             UniqueConstraint(
@@ -150,8 +190,14 @@ class StreamCount(BaseCount):
             models.Index(
                 fields=["property", "realm", "end_time"],
                 name="analytics_streamcount_property_realm_id_end_time_155ae930_idx",
-            )
+            ),
+            # Index for queries filtering by stream and property
+            models.Index(
+                fields=["stream", "property", "end_time"],
+                name="analytics_streamcount_stream_property_end_time_idx",
+            ),
         ]
+        ordering = ["stream", "property", "end_time"]
 
     @override
     def __str__(self) -> str:
