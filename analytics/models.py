@@ -59,6 +59,12 @@ class InstallationCount(BaseCount):
                 name="unique_installation_count_null_subgroup",
             ),
         ]
+        indexes = [
+            models.Index(
+                fields=["property", "end_time"],
+                name="analytics_installationcount_property_end_time_idx",
+            )
+        ]
 
     @override
     def __str__(self) -> str:
@@ -118,7 +124,11 @@ class UserCount(BaseCount):
             models.Index(
                 fields=["property", "realm", "end_time"],
                 name="analytics_usercount_property_realm_id_end_time_591dbec1_idx",
-            )
+            ),
+            models.Index(
+                fields=["property", "end_time"],
+                name="analytics_usercount_property_end_time_idx",
+            ),
         ]
 
     @override
@@ -150,7 +160,11 @@ class StreamCount(BaseCount):
             models.Index(
                 fields=["property", "realm", "end_time"],
                 name="analytics_streamcount_property_realm_id_end_time_155ae930_idx",
-            )
+            ),
+            models.Index(
+                fields=["property", "end_time"],
+                name="analytics_streamcount_property_end_time_idx",
+            ),
         ]
 
     @override
