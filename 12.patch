@@ -1,0 +1,35 @@
+diff --git a/analytics/tests/test_counts.py b/analytics/tests/test_counts.py
+index 21fbe67e55..10bac03072 100644
+--- a/analytics/tests/test_counts.py
++++ b/analytics/tests/test_counts.py
+@@ -1292,6 +1292,30 @@ class TestDoAggregateToSummaryTable(AnalyticsTestCase):
+         self.assertFalse(RealmCount.objects.exists())
+         self.assertFalse(InstallationCount.objects.exists())
+ 
++    def test_logs_aggregation(self) -> None:
++        stat = LoggingCountStat("test stat", UserCount, CountStat.HOUR)
++        user = self.create_user()
++        UserCount.objects.create(
++            user=user,
++            realm=user.realm,
++            property=stat.property,
++            end_time=self.TIME_ZERO,
++            value=1,
++        )
++
++        with self.assertLogs("zulip.analytics", level="INFO") as info_log:
++            do_aggregate_to_summary_table(stat, self.TIME_ZERO)
++
++        self.assertEqual(len(info_log.output), 2)
++        self.assertRegex(
++            info_log.output[0],
++            r"INFO:zulip\.analytics:test stat RealmCount aggregation \(\d+ms/1r\)",
++        )
++        self.assertRegex(
++            info_log.output[1],
++            r"INFO:zulip\.analytics:test stat InstallationCount aggregation \(\d+ms/1r\)",
++        )
++
+ 
+ class TestDoIncrementLoggingStat(AnalyticsTestCase):
+     def test_table_and_id_args(self) -> None:
