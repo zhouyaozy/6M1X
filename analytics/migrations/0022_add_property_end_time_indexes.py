@@ -1,0 +1,31 @@
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+    dependencies = [
+        ("analytics", "0021_alter_fillstate_id"),
+    ]
+
+    operations = [
+        migrations.AddIndex(
+            model_name="installationcount",
+            index=models.Index(
+                fields=["property", "end_time"],
+                name="analytics_installationcount_property_end_time_idx",
+            ),
+        ),
+        migrations.AddIndex(
+            model_name="usercount",
+            index=models.Index(
+                fields=["property", "end_time"],
+                name="analytics_usercount_property_end_time_idx",
+            ),
+        ),
+        migrations.AddIndex(
+            model_name="streamcount",
+            index=models.Index(
+                fields=["property", "end_time"],
+                name="analytics_streamcount_property_end_time_idx",
+            ),
+        ),
+    ]
