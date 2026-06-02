@@ -1,0 +1,101 @@
+diff --git a/analytics/tests/test_counts.py b/analytics/tests/test_counts.py
+index 21fbe67e55..559a38ad17 100644
+--- a/analytics/tests/test_counts.py
++++ b/analytics/tests/test_counts.py
+@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
+ from typing import Any
+ from unittest import mock
+ 
++import logging
+ import time_machine
+ from django.apps import apps
+ from django.db.models import Sum
+@@ -292,17 +293,41 @@ class TestProcessCountStat(AnalyticsTestCase):
+         # process new stat
+         current_time = installation_epoch() + self.HOUR
+         stat = self.make_dummy_count_stat("test stat")
+-        process_count_stat(stat, current_time)
++        with self.assertLogs("zulip.analytics", level="INFO") as info_logs:
++            process_count_stat(stat, current_time)
++        self.assertTrue(
++            any(f"INFO:zulip.analytics:INITIALIZED {stat.property} {installation_epoch()}" in log for log in info_logs.output)
++        )
++        self.assertTrue(
++            any(f"INFO:zulip.analytics:START {stat.property} {current_time}" in log for log in info_logs.output)
++        )
++        self.assertTrue(
++            any(f"INFO:zulip.analytics:DONE {stat.property}" in log for log in info_logs.output)
++        )
+         self.assertFillStateEquals(stat, current_time)
+         self.assertEqual(InstallationCount.objects.filter(property=stat.property).count(), 1)
+ 
+         # dirty stat
+         FillState.objects.filter(property=stat.property).update(state=FillState.STARTED)
+-        process_count_stat(stat, current_time)
++        with self.assertLogs("zulip.analytics", level="INFO") as info_logs:
++            process_count_stat(stat, current_time)
++        self.assertTrue(
++            any(f"INFO:zulip.analytics:UNDO START {stat.property} {current_time}" in log for log in info_logs.output)
++        )
++        self.assertTrue(
++            any(f"INFO:zulip.analytics:UNDO DONE {stat.property}" in log for log in info_logs.output)
++        )
++        self.assertTrue(
++            any(f"INFO:zulip.analytics:START {stat.property} {current_time}" in log for log in info_logs.output)
++        )
++        self.assertTrue(
++            any(f"INFO:zulip.analytics:DONE {stat.property}" in log for log in info_logs.output)
++        )
+         self.assertFillStateEquals(stat, current_time)
+         self.assertEqual(InstallationCount.objects.filter(property=stat.property).count(), 1)
+ 
+         # clean stat, no update
++        # assertLogs would fail if there are no logs, so we don't use it here
+         process_count_stat(stat, current_time)
+         self.assertFillStateEquals(stat, current_time)
+         self.assertEqual(InstallationCount.objects.filter(property=stat.property).count(), 1)
+@@ -310,7 +335,14 @@ class TestProcessCountStat(AnalyticsTestCase):
+         # clean stat, with update
+         current_time += self.HOUR
+         stat = self.make_dummy_count_stat("test stat")
+-        process_count_stat(stat, current_time)
++        with self.assertLogs("zulip.analytics", level="INFO") as info_logs:
++            process_count_stat(stat, current_time)
++        self.assertTrue(
++            any(f"INFO:zulip.analytics:START {stat.property} {current_time}" in log for log in info_logs.output)
++        )
++        self.assertTrue(
++            any(f"INFO:zulip.analytics:DONE {stat.property}" in log for log in info_logs.output)
++        )
+         self.assertFillStateEquals(stat, current_time)
+         self.assertEqual(InstallationCount.objects.filter(property=stat.property).count(), 2)
+ 
+@@ -366,8 +398,10 @@ class TestProcessCountStat(AnalyticsTestCase):
+         FillState.objects.update(state=FillState.STARTED)
+ 
+         # Check that the change propagated (and the collected data wasn't deleted)
+-        for stat in [user_stat, stream_stat, realm_stat]:
+-            process_count_stat(stat, end_time)
++        with self.assertLogs("zulip.analytics", level="INFO") as info_logs:
++            for stat in [user_stat, stream_stat, realm_stat]:
++                process_count_stat(stat, end_time)
++        self.assertTrue(any(f"INFO:zulip.analytics:UNDO START {user_stat.property}" in log for log in info_logs.output))
+         self.assertTableState(UserCount, ["property", "value"], [[user_stat.property, 6]])
+         self.assertTableState(StreamCount, ["property", "value"], [[stream_stat.property, 6]])
+         self.assertTableState(
+@@ -427,7 +461,14 @@ class TestProcessCountStat(AnalyticsTestCase):
+ 
+             # test when one dependency has been run, and the other hasn't
+             process_count_stat(stat1, hour[2])
+-            process_count_stat(stat3, hour[1])
++            with self.assertLogs("zulip.analytics", level="WARNING") as warning_logs:
++                process_count_stat(stat3, hour[1])
++            self.assertEqual(
++                warning_logs.output,
++                [
++                    f"WARNING:zulip.analytics:DependentCountStat {stat3.property} run before dependency stat2."
++                ],
++            )
+             self.assertTableState(
+                 InstallationCount,
+                 ["property", "end_time"],
