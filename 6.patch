@@ -1,0 +1,109 @@
+diff --git a/analytics/models.py b/analytics/models.py
+index 7a322a47a3..78c36bf8fc 100644
+--- a/analytics/models.py
++++ b/analytics/models.py
+@@ -1,4 +1,5 @@
+ from datetime import datetime
++from functools import lru_cache
+ 
+ from django.db import models
+ from django.db.models import Q, UniqueConstraint
+@@ -24,6 +25,7 @@ class FillState(models.Model):
+ 
+ # The earliest/starting end_time in FillState
+ # We assume there is at least one realm
++@lru_cache(maxsize=1)
+ def installation_epoch() -> datetime:
+     earliest_realm_creation = Realm.objects.aggregate(models.Min("date_created"))[
+         "date_created__min"
+@@ -59,6 +61,12 @@ class InstallationCount(BaseCount):
+                 name="unique_installation_count_null_subgroup",
+             ),
+         ]
++        indexes = [
++            models.Index(
++                fields=["property", "end_time"],
++                name="analytics_installationcount_property_end_time_idx",
++            ),
++        ]
+ 
+     @override
+     def __str__(self) -> str:
+@@ -66,7 +74,7 @@ class InstallationCount(BaseCount):
+ 
+ 
+ class RealmCount(BaseCount):
+-    realm = models.ForeignKey(Realm, on_delete=models.CASCADE)
++    realm = models.ForeignKey(Realm, on_delete=models.CASCADE, db_index=True)
+ 
+     class Meta:
+         # Handles invalid duplicate RealmCount data
+@@ -86,7 +94,11 @@ class RealmCount(BaseCount):
+             models.Index(
+                 fields=["property", "end_time"],
+                 name="analytics_realmcount_property_end_time_3b60396b_idx",
+-            )
++            ),
++            models.Index(
++                fields=["realm", "property", "end_time"],
++                name="analytics_realmcount_realm_property_end_time_idx",
++            ),
+         ]
+ 
+     @override
+@@ -95,8 +107,8 @@ class RealmCount(BaseCount):
+ 
+ 
+ class UserCount(BaseCount):
+-    user = models.ForeignKey(UserProfile, on_delete=models.CASCADE)
+-    realm = models.ForeignKey(Realm, on_delete=models.CASCADE)
++    user = models.ForeignKey(UserProfile, on_delete=models.CASCADE, db_index=True)
++    realm = models.ForeignKey(Realm, on_delete=models.CASCADE, db_index=True)
+ 
+     class Meta:
+         # Handles invalid duplicate UserCount data
+@@ -118,7 +130,15 @@ class UserCount(BaseCount):
+             models.Index(
+                 fields=["property", "realm", "end_time"],
+                 name="analytics_usercount_property_realm_id_end_time_591dbec1_idx",
+-            )
++            ),
++            models.Index(
++                fields=["realm", "property", "end_time"],
++                name="analytics_usercount_realm_property_end_time_idx",
++            ),
++            models.Index(
++                fields=["user", "property", "end_time"],
++                name="analytics_usercount_user_property_end_time_idx",
++            ),
+         ]
+ 
+     @override
+@@ -127,8 +147,8 @@ class UserCount(BaseCount):
+ 
+ 
+ class StreamCount(BaseCount):
+-    stream = models.ForeignKey(Stream, on_delete=models.CASCADE)
+-    realm = models.ForeignKey(Realm, on_delete=models.CASCADE)
++    stream = models.ForeignKey(Stream, on_delete=models.CASCADE, db_index=True)
++    realm = models.ForeignKey(Realm, on_delete=models.CASCADE, db_index=True)
+ 
+     class Meta:
+         # Handles invalid duplicate StreamCount data
+@@ -150,7 +170,15 @@ class StreamCount(BaseCount):
+             models.Index(
+                 fields=["property", "realm", "end_time"],
+                 name="analytics_streamcount_property_realm_id_end_time_155ae930_idx",
+-            )
++            ),
++            models.Index(
++                fields=["realm", "property", "end_time"],
++                name="analytics_streamcount_realm_property_end_time_idx",
++            ),
++            models.Index(
++                fields=["stream", "property", "end_time"],
++                name="analytics_streamcount_stream_property_end_time_idx",
++            ),
+         ]
+ 
+     @override
