@@ -1,29 +1,15 @@
-from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Literal
+from typing import Any
 
 from django.utils.timezone import now as timezone_now
 from typing_extensions import override
 
 from analytics.lib.counts import ALL_COUNT_STATS, CountStat
 from analytics.models import installation_epoch
-from scripts.lib.zulip_tools import atomic_nagios_write
 from zerver.lib.management import ZulipBaseCommand
+from zerver.lib.nagios import NagiosResult
 from zerver.lib.timestamp import TimeZoneNotUTCError, floor_to_day, floor_to_hour, verify_UTC
 from zerver.models import Realm
-
-states = {
-    0: "OK",
-    1: "WARNING",
-    2: "CRITICAL",
-    3: "UNKNOWN",
-}
-
-
-@dataclass
-class NagiosResult:
-    status: Literal["ok", "warning", "critical", "unknown"]
-    message: str
 
 
 class Command(ZulipBaseCommand):
@@ -34,7 +20,7 @@ class Command(ZulipBaseCommand):
     @override
     def handle(self, *args: Any, **options: Any) -> None:
         fill_state = self.get_fill_state()
-        atomic_nagios_write("check-analytics-state", fill_state.status, fill_state.message)
+        fill_state.write("check-analytics-state")
 
     def get_fill_state(self) -> NagiosResult:
         if not Realm.objects.exists():
