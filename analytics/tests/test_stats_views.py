@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+import time
+import statistics
 
 from django.utils.timezone import now as timezone_now
 from typing_extensions import override
@@ -687,3 +689,219 @@ class TestMapArrays(ZulipTestCase):
                 "Terminal app": [9, 10, 11],
             },
         )
+
+
+class TestStatsViewsPerformance(ZulipTestCase):
+    """性能测试类，用于测试分析视图的性能表现。"""
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.user = self.example_user("hamlet")
+        self.login_user(self.user)
+        self.realm = get_realm("zulip")
+        self.stream_id = self.get_stream_id(self.get_streams(self.user)[0])
+
+    def _measure_performance(self, func, iterations: int = 10) -> dict[str, float]:
+        """测量函数执行时间的辅助方法。"""
+        times = []
+        for _ in range(iterations):
+            start = time.perf_counter()
+            func()
+            end = time.perf_counter()
+            times.append(end - start)
+        return {
+            "mean": statistics.mean(times),
+            "median": statistics.median(times),
+            "min": min(times),
+            "max": max(times),
+            "stdev": statistics.stdev(times) if len(times) > 1 else 0.0,
+        }
+
+    def _setup_test_data(self) -> None:
+        """设置测试数据，包括统计数据。"""
+        stat_hour = COUNT_STATS["messages_sent:is_bot:hour"]
+        stat_day = COUNT_STATS["messages_sent:message_type:day"]
+        stat_humans = COUNT_STATS["realm_active_humans::day"]
+
+        if stat_hour.frequency == CountStat.HOUR:
+            end_times_hour = [
+                ceiling_to_hour(self.realm.date_created) + timedelta(hours=i) for i in range(24)
+            ]
+            for end_time in end_times_hour:
+                RealmCount.objects.bulk_create(
+                    [
+                        RealmCount(
+                            property=stat_hour.property,
+                            subgroup="false",
+                            end_time=end_time,
+                            value=100 + i,
+                            realm=self.realm,
+                        )
+                        for i in range(3)
+                    ]
+                )
+            FillState.objects.create(property=stat_hour.property, end_time=end_times_hour[-1], state=FillState.DONE)
+
+        if stat_day.frequency == CountStat.DAY:
+            end_times_day = [
+                ceiling_to_day(self.realm.date_created) + timedelta(days=i) for i in range(30)
+            ]
+            for end_time in end_times_day:
+                RealmCount.objects.bulk_create(
+                    [
+                        RealmCount(
+                            property=stat_day.property,
+                            subgroup=subgroup,
+                            end_time=end_time,
+                            value=50 + i,
+                            realm=self.realm,
+                        )
+                        for i, subgroup in enumerate(["public_stream", "private_message"])
+                    ]
+                )
+            FillState.objects.create(property=stat_day.property, end_time=end_times_day[-1], state=FillState.DONE)
+
+        if stat_humans.frequency == CountStat.DAY:
+            end_times_humans = [
+                ceiling_to_day(self.realm.date_created) + timedelta(days=i) for i in range(30)
+            ]
+            for end_time in end_times_humans:
+                RealmCount.objects.create(
+                    property=stat_humans.property,
+                    subgroup=None,
+                    end_time=end_time,
+                    value=15,
+                    realm=self.realm,
+                )
+            FillState.objects.create(property=stat_humans.property, end_time=end_times_humans[-1], state=FillState.DONE)
+
+    def test_stats_page_performance(self) -> None:
+        """测试统计页面加载性能。"""
+        def access_stats_page():
+            result = self.client_get("/stats")
+            self.assertEqual(result.status_code, 200)
+
+        perf = self._measure_performance(access_stats_page, iterations=5)
+        self.assertLess(perf["mean"], 5.0, "统计页面平均响应时间过长")
+
+    def test_chart_data_messages_sent_performance(self) -> None:
+        """测试获取消息发送图表数据的性能。"""
+        self._setup_test_data()
+
+        def get_messages_sent_data():
+            result = self.client_get("/json/analytics/chart_data", {"chart_name": "messages_sent_over_time"})
+            self.assert_json_success(result)
+
+        perf = self._measure_performance(get_messages_sent_data, iterations=10)
+        self.assertLess(perf["mean"], 2.0, "消息发送图表API平均响应时间过长")
+
+    def test_chart_data_number_of_humans_performance(self) -> None:
+        """测试获取活跃人数图表数据的性能。"""
+        self._setup_test_data()
+
+        def get_humans_data():
+            result = self.client_get("/json/analytics/chart_data", {"chart_name": "number_of_humans"})
+            self.assert_json_success(result)
+
+        perf = self._measure_performance(get_humans_data, iterations=10)
+        self.assertLess(perf["mean"], 2.0, "活跃人数图表API平均响应时间过长")
+
+    def test_chart_data_messages_by_client_performance(self) -> None:
+        """测试获取按客户端统计消息数据的性能。"""
+        self._setup_test_data()
+
+        stat = COUNT_STATS["messages_sent:client:day"]
+        client1 = Client.objects.create(name="client_1")
+        client2 = Client.objects.create(name="client_2")
+        client3 = Client.objects.create(name="client_3")
+
+        end_times_day = [ceiling_to_day(self.realm.date_created) + timedelta(days=i) for i in range(10)]
+        for end_time in end_times_day:
+            RealmCount.objects.bulk_create(
+                [
+                    RealmCount(
+                        property=stat.property,
+                        subgroup=str(client1.id),
+                        end_time=end_time,
+                        value=50 + i,
+                        realm=self.realm,
+                    ),
+                    RealmCount(
+                        property=stat.property,
+                        subgroup=str(client2.id),
+                        end_time=end_time,
+                        value=30 + i,
+                        realm=self.realm,
+                    ),
+                    RealmCount(
+                        property=stat.property,
+                        subgroup=str(client3.id),
+                        end_time=end_time,
+                        value=20 + i,
+                        realm=self.realm,
+                    ),
+                ]
+            )
+        FillState.objects.create(property=stat.property, end_time=end_times_day[-1], state=FillState.DONE)
+
+        def get_client_data():
+            result = self.client_get("/json/analytics/chart_data", {"chart_name": "messages_sent_by_client"})
+            self.assert_json_success(result)
+
+        perf = self._measure_performance(get_client_data, iterations=10)
+        self.assertLess(perf["mean"], 2.0, "客户端消息统计API平均响应时间过长")
+
+    def test_large_dataset_performance(self) -> None:
+        """测试大数据集下的性能表现。"""
+        stat = COUNT_STATS["messages_sent:is_bot:hour"]
+        end_times = [
+            ceiling_to_hour(self.realm.date_created) + timedelta(hours=i) for i in range(720)  # 30天 * 24小时
+        ]
+
+        for end_time in end_times:
+            RealmCount.objects.bulk_create(
+                [
+                    RealmCount(
+                        property=stat.property,
+                        subgroup="false",
+                        end_time=end_time,
+                        value=100 + i,
+                        realm=self.realm,
+                    )
+                    for i in range(10)
+                ]
+            )
+            UserCount.objects.bulk_create(
+                [
+                    UserCount(
+                        property=stat.property,
+                        subgroup="false",
+                        end_time=end_time,
+                        value=50 + i,
+                        realm=self.realm,
+                        user=self.user,
+                    )
+                    for i in range(5)
+                ]
+            )
+        FillState.objects.create(property=stat.property, end_time=end_times[-1], state=FillState.DONE)
+
+        def access_large_dataset():
+            result = self.client_get("/json/analytics/chart_data", {"chart_name": "messages_sent_over_time"})
+            self.assert_json_success(result)
+
+        perf = self._measure_performance(access_large_dataset, iterations=5)
+        self.assertLess(perf["mean"], 5.0, "大数据集下图表API平均响应时间过长")
+
+    def test_concurrent_requests_simulation(self) -> None:
+        """模拟多个并发请求的性能。"""
+        self._setup_test_data()
+
+        def multiple_requests():
+            self.client_get("/json/analytics/chart_data", {"chart_name": "messages_sent_over_time"})
+            self.client_get("/json/analytics/chart_data", {"chart_name": "number_of_humans"})
+            self.client_get("/json/analytics/chart_data", {"chart_name": "messages_sent_by_message_type"})
+
+        perf = self._measure_performance(multiple_requests, iterations=5)
+        self.assertLess(perf["mean"], 5.0, "多个并发请求的平均响应时间过长")
