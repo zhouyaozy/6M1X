@@ -1,0 +1,177 @@
+diff --git a/analytics/tests/test_stats_views.py b/analytics/tests/test_stats_views.py
+index 68f6190f09..5e45310cba 100644
+--- a/analytics/tests/test_stats_views.py
++++ b/analytics/tests/test_stats_views.py
+@@ -1,3 +1,4 @@
++import time
+ from datetime import datetime, timedelta, timezone
+ 
+ from django.utils.timezone import now as timezone_now
+@@ -687,3 +688,167 @@ class TestMapArrays(ZulipTestCase):
+                 "Terminal app": [9, 10, 11],
+             },
+         )
++
++
++class TestStatsPerformance(ZulipTestCase):
++    @override
++    def setUp(self) -> None:
++        super().setUp()
++        self.realm = get_realm("zulip")
++        self.user = self.example_user("hamlet")
++        self.login_user(self.user)
++        self.stream_id = self.get_stream_id(self.get_streams(self.user)[0])
++
++    def _insert_data(self, stat: CountStat, subgroups: list[str | None], num_points: int) -> None:
++        end_times = [
++            ceiling_to_day(self.realm.date_created) + timedelta(days=i)
++            for i in range(num_points)
++        ]
++        fill_time = end_times[-1]
++
++        items = [
++            RealmCount(
++                property=stat.property,
++                subgroup=subgroups[i % len(subgroups)],
++                end_time=end_times[i],
++                value=100 + i,
++                realm=self.realm,
++            )
++            for i in range(num_points)
++        ]
++        RealmCount.objects.bulk_create(items)
++        FillState.objects.create(property=stat.property, end_time=fill_time, state=FillState.DONE)
++
++    def _insert_hourly_data(self, stat: CountStat, subgroups: list[str | None], num_hours: int) -> None:
++        end_times = [
++            ceiling_to_hour(self.realm.date_created) + timedelta(hours=i)
++            for i in range(num_hours)
++        ]
++        fill_time = end_times[-1]
++
++        items = [
++            RealmCount(
++                property=stat.property,
++                subgroup=subgroups[i % len(subgroups)],
++                end_time=end_times[i],
++                value=100 + i,
++                realm=self.realm,
++            )
++            for i in range(num_hours)
++        ]
++        RealmCount.objects.bulk_create(items)
++        FillState.objects.create(property=stat.property, end_time=fill_time, state=FillState.DONE)
++
++    def test_chart_data_endpoint_performance(self) -> None:
++        stat = COUNT_STATS["realm_active_humans::day"]
++        self._insert_data(stat, [None], 30)
++        stat = COUNT_STATS["1day_actives::day"]
++        self._insert_data(stat, [None], 30)
++        stat = COUNT_STATS["active_users_audit:is_bot:day"]
++        self._insert_data(stat, ["false"], 30)
++
++        start = time.perf_counter()
++        result = self.client_get(
++            "/json/analytics/chart_data", {"chart_name": "number_of_humans"}
++        )
++        elapsed = time.perf_counter() - start
++        self.assert_json_success(result)
++        self.assertLess(elapsed, 2.0, f"number_of_humans endpoint took {elapsed:.2f}s")
++
++        stat = COUNT_STATS["messages_sent:is_bot:hour"]
++        self._insert_hourly_data(stat, ["true", "false"], 48)
++
++        start = time.perf_counter()
++        result = self.client_get(
++            "/json/analytics/chart_data", {"chart_name": "messages_sent_over_time"}
++        )
++        elapsed = time.perf_counter() - start
++        self.assert_json_success(result)
++        self.assertLess(elapsed, 2.0, f"messages_sent_over_time endpoint took {elapsed:.2f}s")
++
++        stat = COUNT_STATS["messages_sent:message_type:day"]
++        self._insert_data(
++            stat, ["public_stream", "private_message", "private_stream", "group_private_message"], 30
++        )
++
++        start = time.perf_counter()
++        result = self.client_get(
++            "/json/analytics/chart_data", {"chart_name": "messages_sent_by_message_type"}
++        )
++        elapsed = time.perf_counter() - start
++        self.assert_json_success(result)
++        self.assertLess(elapsed, 2.0, f"messages_sent_by_message_type endpoint took {elapsed:.2f}s")
++
++        stat = COUNT_STATS["messages_read::hour"]
++        self._insert_hourly_data(stat, [None], 48)
++
++        start = time.perf_counter()
++        result = self.client_get(
++            "/json/analytics/chart_data", {"chart_name": "messages_read_over_time"}
++        )
++        elapsed = time.perf_counter() - start
++        self.assert_json_success(result)
++        self.assertLess(elapsed, 2.0, f"messages_read_over_time endpoint took {elapsed:.2f}s")
++
++    def test_large_dataset_chart_data(self) -> None:
++        stat = COUNT_STATS["messages_sent:is_bot:hour"]
++        self._insert_hourly_data(stat, ["true", "false"], 168)
++
++        start = time.perf_counter()
++        result = self.client_get(
++            "/json/analytics/chart_data", {"chart_name": "messages_sent_over_time"}
++        )
++        elapsed = time.perf_counter() - start
++        data = self.assert_json_success(result)
++        self.assertLess(elapsed, 5.0, f"Large dataset query took {elapsed:.2f}s")
++        self.assertGreater(len(data["end_times"]), 100)
++
++        stat = COUNT_STATS["realm_active_humans::day"]
++        self._insert_data(stat, [None], 90)
++        stat = COUNT_STATS["1day_actives::day"]
++        self._insert_data(stat, [None], 90)
++        stat = COUNT_STATS["active_users_audit:is_bot:day"]
++        self._insert_data(stat, ["false"], 90)
++
++        start = time.perf_counter()
++        result = self.client_get(
++            "/json/analytics/chart_data", {"chart_name": "number_of_humans"}
++        )
++        elapsed = time.perf_counter() - start
++        data = self.assert_json_success(result)
++        self.assertLess(elapsed, 5.0, f"Large dataset number_of_humans took {elapsed:.2f}s")
++        self.assertGreater(len(data["end_times"]), 80)
++
++    def test_rewrite_client_arrays_performance(self) -> None:
++        large_input = {}
++        for i in range(200):
++            large_input[f"client_{i}"] = list(range(i, i + 50))
++
++        start = time.perf_counter()
++        result = rewrite_client_arrays(large_input)
++        elapsed = time.perf_counter() - start
++        self.assertLess(elapsed, 0.5, f"rewrite_client_arrays took {elapsed:.4f}s")
++        self.assertGreater(len(result), 0)
++
++    def test_sort_client_labels_performance(self) -> None:
++        large_data: dict[str, dict[str, list[int]]] = {"everyone": {}, "user": {}}
++        for i in range(200):
++            large_data["everyone"][f"client_{i}"] = [i]
++            large_data["user"][f"client_{i}"] = [i * 2]
++
++        start = time.perf_counter()
++        result = sort_client_labels(large_data)
++        elapsed = time.perf_counter() - start
++        self.assertLess(elapsed, 0.1, f"sort_client_labels took {elapsed:.4f}s")
++        self.assert_length(result, 200)
++
++    def test_sort_by_totals_performance(self) -> None:
++        value_arrays: dict[str, list[int]] = {}
++        for i in range(500):
++            value_arrays[f"key_{i}"] = list(range(i % 100))
++
++        start = time.perf_counter()
++        result = sort_by_totals(value_arrays)
++        elapsed = time.perf_counter() - start
++        self.assertLess(elapsed, 0.1, f"sort_by_totals took {elapsed:.4f}s")
++        self.assert_length(result, 500)
