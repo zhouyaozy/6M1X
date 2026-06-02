@@ -1,0 +1,185 @@
+diff --git a/analytics/management/__init__.py b/analytics/management/__init__.py
+index e69de29bb2..42241e5d47 100644
+--- a/analytics/management/__init__.py
++++ b/analytics/management/__init__.py
+@@ -0,0 +1,3 @@
++from analytics.management.business import get_count_stat as get_count_stat
++from analytics.management.business import get_count_stats_to_process as get_count_stats_to_process
++from analytics.management.business import resolve_fill_to_time as resolve_fill_to_time
+diff --git a/analytics/management/business.py b/analytics/management/business.py
+new file mode 100644
+index 0000000000..0b8bf44772
+--- /dev/null
++++ b/analytics/management/business.py
+@@ -0,0 +1,33 @@
++from datetime import datetime, timezone
++
++from django.core.management.base import CommandError
++from django.utils.dateparse import parse_datetime
++
++from analytics.lib.counts import ALL_COUNT_STATS, CountStat
++from zerver.lib.timestamp import floor_to_hour
++
++
++def get_count_stat(stat_property: str) -> CountStat:
++    try:
++        return ALL_COUNT_STATS[stat_property]
++    except KeyError as exc:
++        raise CommandError(f"Invalid property: {stat_property}") from exc
++
++
++def get_count_stats_to_process(stat_property: str | None) -> list[CountStat]:
++    if stat_property is None:
++        return list(ALL_COUNT_STATS.values())
++    return [get_count_stat(stat_property)]
++
++
++def resolve_fill_to_time(time_string: str, *, use_utc: bool) -> datetime:
++    fill_to_time = parse_datetime(time_string)
++    if fill_to_time is None:
++        raise CommandError(f"Invalid time: {time_string}")
++    if use_utc:
++        fill_to_time = fill_to_time.replace(tzinfo=timezone.utc)
++    if fill_to_time.tzinfo is None:
++        raise CommandError(
++            "--time must be time-zone-aware. Maybe you meant to use the --utc option?"
++        )
++    return floor_to_hour(fill_to_time.astimezone(timezone.utc))
+diff --git a/analytics/management/commands/clear_single_stat.py b/analytics/management/commands/clear_single_stat.py
+index 751f2ec987..b0ebe66c2e 100644
+--- a/analytics/management/commands/clear_single_stat.py
++++ b/analytics/management/commands/clear_single_stat.py
+@@ -4,7 +4,8 @@ from typing import Any
+ from django.core.management.base import CommandError
+ from typing_extensions import override
+ 
+-from analytics.lib.counts import ALL_COUNT_STATS, do_drop_single_stat
++from analytics.lib.counts import do_drop_single_stat
++from analytics.management import get_count_stat
+ from zerver.lib.management import ZulipBaseCommand
+ 
+ 
+@@ -18,10 +19,9 @@ class Command(ZulipBaseCommand):
+ 
+     @override
+     def handle(self, *args: Any, **options: Any) -> None:
+-        property = options["property"]
+-        if property not in ALL_COUNT_STATS:
+-            raise CommandError(f"Invalid property: {property}")
++        stat_property = options["property"]
++        get_count_stat(stat_property)
+         if not options["force"]:
+             raise CommandError("No action taken. Use --force.")
+ 
+-        do_drop_single_stat(property)
++        do_drop_single_stat(stat_property)
+diff --git a/analytics/management/commands/update_analytics_counts.py b/analytics/management/commands/update_analytics_counts.py
+index d97675ba37..6fef2d7b89 100644
+--- a/analytics/management/commands/update_analytics_counts.py
++++ b/analytics/management/commands/update_analytics_counts.py
+@@ -1,18 +1,16 @@
+ import hashlib
+ import time
+ from argparse import ArgumentParser
+-from datetime import timezone
+ from typing import Any
+ 
+ from django.conf import settings
+-from django.utils.dateparse import parse_datetime
+ from django.utils.timezone import now as timezone_now
+ from typing_extensions import override
+ 
+-from analytics.lib.counts import ALL_COUNT_STATS, logger, process_count_stat
++from analytics.lib.counts import logger, process_count_stat
++from analytics.management import get_count_stats_to_process, resolve_fill_to_time
+ from zerver.lib.management import ZulipBaseCommand, abort_cron_during_deploy, abort_unless_locked
+ from zerver.lib.remote_server import send_server_data_to_push_bouncer, should_send_analytics_data
+-from zerver.lib.timestamp import floor_to_hour
+ from zerver.models import Realm
+ 
+ 
+@@ -44,27 +42,12 @@ class Command(ZulipBaseCommand):
+         self.run_update_analytics_counts(options)
+ 
+     def run_update_analytics_counts(self, options: dict[str, Any]) -> None:
+-        # installation_epoch relies on there being at least one realm; we
+-        # shouldn't run the analytics code if that condition isn't satisfied
+         if not Realm.objects.exists():
+             logger.info("No realms, stopping update_analytics_counts")
+             return
+ 
+-        fill_to_time = parse_datetime(options["time"])
+-        assert fill_to_time is not None
+-        if options["utc"]:
+-            fill_to_time = fill_to_time.replace(tzinfo=timezone.utc)
+-        if fill_to_time.tzinfo is None:
+-            raise ValueError(
+-                "--time must be time-zone-aware. Maybe you meant to use the --utc option?"
+-            )
+-
+-        fill_to_time = floor_to_hour(fill_to_time.astimezone(timezone.utc))
+-
+-        if options["stat"] is not None:
+-            stats = [ALL_COUNT_STATS[options["stat"]]]
+-        else:
+-            stats = list(ALL_COUNT_STATS.values())
++        fill_to_time = resolve_fill_to_time(options["time"], use_utc=options["utc"])
++        stats = get_count_stats_to_process(options["stat"])
+ 
+         logger.info("Starting updating analytics counts through %s", fill_to_time)
+         if options["verbose"]:
+@@ -84,11 +67,6 @@ class Command(ZulipBaseCommand):
+         logger.info("Finished updating analytics counts through %s", fill_to_time)
+ 
+         if should_send_analytics_data():
+-            # Based on the specific value of the setting, the exact details to send
+-            # will be decided. However, we proceed just based on this not being falsey.
+-
+-            # Skew 0-10 minutes based on a hash of settings.ZULIP_ORG_ID, so
+-            # that each server will report in at a somewhat consistent time.
+             assert settings.ZULIP_ORG_ID
+             delay = int.from_bytes(
+                 hashlib.sha256(settings.ZULIP_ORG_ID.encode()).digest(), byteorder="big"
+diff --git a/analytics/tests/test_management_business.py b/analytics/tests/test_management_business.py
+new file mode 100644
+index 0000000000..eac79a0358
+--- /dev/null
++++ b/analytics/tests/test_management_business.py
+@@ -0,0 +1,37 @@
++from datetime import datetime, timezone
++
++from django.core.management.base import CommandError
++
++from analytics.lib.counts import ALL_COUNT_STATS
++from analytics.management import get_count_stat, get_count_stats_to_process, resolve_fill_to_time
++from zerver.lib.test_classes import ZulipTestCase
++
++
++class TestAnalyticsManagementBusiness(ZulipTestCase):
++    def test_get_count_stat(self) -> None:
++        stat = get_count_stat("messages_sent:is_bot:hour")
++        self.assertEqual(stat, ALL_COUNT_STATS["messages_sent:is_bot:hour"])
++
++    def test_get_count_stat_rejects_unknown_property(self) -> None:
++        with self.assertRaisesRegex(CommandError, "Invalid property: invalid-property"):
++            get_count_stat("invalid-property")
++
++    def test_get_count_stats_to_process_with_none(self) -> None:
++        stats = get_count_stats_to_process(None)
++        self.assertEqual(stats, list(ALL_COUNT_STATS.values()))
++
++    def test_resolve_fill_to_time_normalizes_to_utc_hour_boundary(self) -> None:
++        fill_to_time = resolve_fill_to_time("2026-06-02T15:45:12+08:00", use_utc=False)
++        self.assertEqual(fill_to_time, datetime(2026, 6, 2, 7, 0, tzinfo=timezone.utc))
++
++    def test_resolve_fill_to_time_adds_utc_when_requested(self) -> None:
++        fill_to_time = resolve_fill_to_time("2026-06-02T15:45:12", use_utc=True)
++        self.assertEqual(fill_to_time, datetime(2026, 6, 2, 15, 0, tzinfo=timezone.utc))
++
++    def test_resolve_fill_to_time_rejects_naive_datetime_without_utc_flag(self) -> None:
++        with self.assertRaisesRegex(CommandError, "--time must be time-zone-aware"):
++            resolve_fill_to_time("2026-06-02T15:45:12", use_utc=False)
++
++    def test_resolve_fill_to_time_rejects_invalid_datetime(self) -> None:
++        with self.assertRaisesRegex(CommandError, "Invalid time: invalid-time"):
++            resolve_fill_to_time("invalid-time", use_utc=False)

@@ -1,18 +1,16 @@
 import hashlib
 import time
 from argparse import ArgumentParser
-from datetime import timezone
 from typing import Any
 
 from django.conf import settings
-from django.utils.dateparse import parse_datetime
 from django.utils.timezone import now as timezone_now
 from typing_extensions import override
 
-from analytics.lib.counts import ALL_COUNT_STATS, logger, process_count_stat
+from analytics.lib.counts import logger, process_count_stat
+from analytics.management import get_count_stats_to_process, resolve_fill_to_time
 from zerver.lib.management import ZulipBaseCommand, abort_cron_during_deploy, abort_unless_locked
 from zerver.lib.remote_server import send_server_data_to_push_bouncer, should_send_analytics_data
-from zerver.lib.timestamp import floor_to_hour
 from zerver.models import Realm
 
 
@@ -44,27 +42,12 @@ class Command(ZulipBaseCommand):
         self.run_update_analytics_counts(options)
 
     def run_update_analytics_counts(self, options: dict[str, Any]) -> None:
-        # installation_epoch relies on there being at least one realm; we
-        # shouldn't run the analytics code if that condition isn't satisfied
         if not Realm.objects.exists():
             logger.info("No realms, stopping update_analytics_counts")
             return
 
-        fill_to_time = parse_datetime(options["time"])
-        assert fill_to_time is not None
-        if options["utc"]:
-            fill_to_time = fill_to_time.replace(tzinfo=timezone.utc)
-        if fill_to_time.tzinfo is None:
-            raise ValueError(
-                "--time must be time-zone-aware. Maybe you meant to use the --utc option?"
-            )
-
-        fill_to_time = floor_to_hour(fill_to_time.astimezone(timezone.utc))
-
-        if options["stat"] is not None:
-            stats = [ALL_COUNT_STATS[options["stat"]]]
-        else:
-            stats = list(ALL_COUNT_STATS.values())
+        fill_to_time = resolve_fill_to_time(options["time"], use_utc=options["utc"])
+        stats = get_count_stats_to_process(options["stat"])
 
         logger.info("Starting updating analytics counts through %s", fill_to_time)
         if options["verbose"]:
@@ -84,11 +67,6 @@ class Command(ZulipBaseCommand):
         logger.info("Finished updating analytics counts through %s", fill_to_time)
 
         if should_send_analytics_data():
-            # Based on the specific value of the setting, the exact details to send
-            # will be decided. However, we proceed just based on this not being falsey.
-
-            # Skew 0-10 minutes based on a hash of settings.ZULIP_ORG_ID, so
-            # that each server will report in at a somewhat consistent time.
             assert settings.ZULIP_ORG_ID
             delay = int.from_bytes(
                 hashlib.sha256(settings.ZULIP_ORG_ID.encode()).digest(), byteorder="big"
