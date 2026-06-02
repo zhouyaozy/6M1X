@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
@@ -90,6 +91,8 @@ from zilencer.models import (
 )
 from zilencer.views import get_last_id_from_server
 
+logger = logging.getLogger("zulip.analytics")
+
 
 class AnalyticsTestCase(ZulipTestCase):
     MINUTE = timedelta(seconds=60)
@@ -101,6 +104,7 @@ class AnalyticsTestCase(ZulipTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        logger.info("Test setup: creating default_realm")
         self.default_realm = do_create_realm(
             string_id="realmtest", name="Realm Test", date_created=self.TIME_ZERO - 2 * self.DAY
         )
@@ -292,6 +296,7 @@ class TestProcessCountStat(AnalyticsTestCase):
         # process new stat
         current_time = installation_epoch() + self.HOUR
         stat = self.make_dummy_count_stat("test stat")
+        logger.info("process_count_stat: %s at %s", stat.property, current_time)
         process_count_stat(stat, current_time)
         self.assertFillStateEquals(stat, current_time)
         self.assertEqual(InstallationCount.objects.filter(property=stat.property).count(), 1)
@@ -345,6 +350,7 @@ class TestProcessCountStat(AnalyticsTestCase):
 
         # Normal run of process_count_stat
         for stat in [user_stat, stream_stat, realm_stat]:
+            logger.info("process_count_stat (logging): %s at %s", stat.property, end_time)
             process_count_stat(stat, end_time)
         self.assertTableState(UserCount, ["property", "value"], [[user_stat.property, 5]])
         self.assertTableState(StreamCount, ["property", "value"], [[stream_stat.property, 5]])
@@ -367,6 +373,7 @@ class TestProcessCountStat(AnalyticsTestCase):
 
         # Check that the change propagated (and the collected data wasn't deleted)
         for stat in [user_stat, stream_stat, realm_stat]:
+            logger.info("process_count_stat (logging, dirty): %s at %s", stat.property, end_time)
             process_count_stat(stat, end_time)
         self.assertTableState(UserCount, ["property", "value"], [[user_stat.property, 6]])
         self.assertTableState(StreamCount, ["property", "value"], [[stream_stat.property, 6]])
@@ -426,7 +433,9 @@ class TestProcessCountStat(AnalyticsTestCase):
             hour = [installation_epoch() + i * self.HOUR for i in range(5)]
 
             # test when one dependency has been run, and the other hasn't
+            logger.info("process_count_stat (dependent): stat1 at %s", hour[2])
             process_count_stat(stat1, hour[2])
+            logger.info("process_count_stat (dependent): stat3 at %s", hour[1])
             process_count_stat(stat3, hour[1])
             self.assertTableState(
                 InstallationCount,
@@ -437,7 +446,9 @@ class TestProcessCountStat(AnalyticsTestCase):
 
             # test that we don't fill past the fill_to_time argument, even if
             # dependencies have later last_successful_fill
+            logger.info("process_count_stat (dependent): stat2 at %s", hour[3])
             process_count_stat(stat2, hour[3])
+            logger.info("process_count_stat (dependent): stat3 at %s", hour[1])
             process_count_stat(stat3, hour[1])
             self.assertTableState(
                 InstallationCount,
@@ -455,6 +466,7 @@ class TestProcessCountStat(AnalyticsTestCase):
 
             # test that we don't fill past the dependency last_successful_fill times,
             # even if fill_to_time is later
+            logger.info("process_count_stat (dependent): stat3 at %s", hour[4])
             process_count_stat(stat3, hour[4])
             self.assertTableState(
                 InstallationCount,
@@ -474,8 +486,11 @@ class TestProcessCountStat(AnalyticsTestCase):
             # test daily dependent stat with hourly dependencies
             hour24 = installation_epoch() + 24 * self.HOUR
             hour25 = installation_epoch() + 25 * self.HOUR
+            logger.info("process_count_stat (dependent): stat1 at %s", hour25)
             process_count_stat(stat1, hour25)
+            logger.info("process_count_stat (dependent): stat2 at %s", hour25)
             process_count_stat(stat2, hour25)
+            logger.info("process_count_stat (dependent): stat4 at %s", hour25)
             process_count_stat(stat4, hour25)
             self.assertEqual(InstallationCount.objects.filter(property="stat4").count(), 1)
             self.assertFillStateEquals(stat4, hour24)
@@ -485,6 +500,7 @@ class TestCountStats(AnalyticsTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        logger.info("TestCountStats setup: creating second_realm")
         # This tests two things for each of the queries/CountStats: Handling
         # more than 1 realm, and the time bounds (time_start and time_end in
         # the queries).
@@ -1288,6 +1304,7 @@ class TestDoAggregateToSummaryTable(AnalyticsTestCase):
     # aggregated, the aggregation table doesn't get a row with value 0.
     def test_no_aggregated_zeros(self) -> None:
         stat = LoggingCountStat("test stat", UserCount, CountStat.HOUR)
+        logger.info("do_aggregate_to_summary_table: %s at %s", stat.property, self.TIME_ZERO)
         do_aggregate_to_summary_table(stat, self.TIME_ZERO)
         self.assertFalse(RealmCount.objects.exists())
         self.assertFalse(InstallationCount.objects.exists())
@@ -1820,6 +1837,7 @@ class TestLoggingCountStats(AnalyticsTestCase):
 
 class TestDeleteStats(AnalyticsTestCase):
     def test_do_drop_all_analytics_tables(self) -> None:
+        logger.info("do_drop_all_analytics_tables")
         user = self.create_user()
         stream = self.create_stream_with_recipient()[0]
         count_args = {"property": "test", "end_time": self.TIME_ZERO, "value": 10}
@@ -1839,6 +1857,7 @@ class TestDeleteStats(AnalyticsTestCase):
             self.assertFalse(table._default_manager.exists())
 
     def test_do_drop_single_stat(self) -> None:
+        logger.info("do_drop_single_stat: to_delete")
         user = self.create_user()
         stream = self.create_stream_with_recipient()[0]
         count_args_to_delete = {"property": "to_delete", "end_time": self.TIME_ZERO, "value": 10}
@@ -1868,6 +1887,7 @@ class TestActiveUsersAudit(AnalyticsTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        logger.info("TestActiveUsersAudit setup")
         self.user = self.create_user(skip_auditlog=True)
         self.stat = COUNT_STATS["active_users_audit:is_bot:day"]
         self.current_property = self.stat.property
@@ -1914,6 +1934,7 @@ class TestActiveUsersAudit(AnalyticsTestCase):
     def test_user_active_then_deactivated_with_day_gap(self) -> None:
         self.add_event(AuditLogEventType.USER_CREATED, 2)
         self.add_event(AuditLogEventType.USER_DEACTIVATED, 1)
+        logger.info("process_count_stat (active_users_audit): %s at %s", self.stat.property, self.TIME_ZERO)
         process_count_stat(self.stat, self.TIME_ZERO)
         self.assertTableState(
             RealmCount, ["subgroup", "end_time"], [["false", self.TIME_ZERO - self.DAY]]
@@ -1922,6 +1943,7 @@ class TestActiveUsersAudit(AnalyticsTestCase):
     def test_user_deactivated_then_reactivated_with_day_gap(self) -> None:
         self.add_event(AuditLogEventType.USER_DEACTIVATED, 2)
         self.add_event(AuditLogEventType.USER_REACTIVATED, 1)
+        logger.info("process_count_stat (active_users_audit): %s at %s", self.stat.property, self.TIME_ZERO)
         process_count_stat(self.stat, self.TIME_ZERO)
         self.assertTableState(RealmCount, ["subgroup"], [["false"]])
 
@@ -1970,6 +1992,7 @@ class TestActiveUsersAudit(AnalyticsTestCase):
     # tests above will not.
     def test_update_from_two_days_ago(self) -> None:
         self.add_event(AuditLogEventType.USER_CREATED, 2)
+        logger.info("process_count_stat (active_users_audit): %s at %s", self.stat.property, self.TIME_ZERO)
         process_count_stat(self.stat, self.TIME_ZERO)
         self.assertTableState(
             RealmCount,
@@ -2046,6 +2069,7 @@ class TestRealmActiveHumans(AnalyticsTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        logger.info("TestRealmActiveHumans setup")
         self.stat = COUNT_STATS["realm_active_humans::day"]
         self.current_property = self.stat.property
 
@@ -2137,6 +2161,7 @@ class TestRealmActiveHumans(AnalyticsTestCase):
             "realm_active_humans::day",
         ]:
             FillState.objects.create(property=property, state=FillState.DONE, end_time=time_zero)
+            logger.info("process_count_stat (end_to_end): %s at %s", property, time_zero + self.DAY)
             process_count_stat(COUNT_STATS[property], time_zero + self.DAY)
         self.assertEqual(
             RealmCount.objects.filter(
