@@ -1,8 +1,11 @@
+import logging
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest import mock
+
+logger = logging.getLogger(__name__)
 
 import time_machine
 from django.apps import apps
@@ -101,9 +104,11 @@ class AnalyticsTestCase(ZulipTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        logger.info("Setting up AnalyticsTestCase")
         self.default_realm = do_create_realm(
             string_id="realmtest", name="Realm Test", date_created=self.TIME_ZERO - 2 * self.DAY
         )
+        logger.debug(f"Created default realm: {self.default_realm.string_id}")
 
         # used to generate unique names in self.create_*
         self.name_counter = 100
@@ -113,6 +118,7 @@ class AnalyticsTestCase(ZulipTestCase):
         # Delete RemoteRealm registrations to have a clean slate - the relevant
         # tests want to construct this from scratch.
         RemoteRealm.objects.all().delete()
+        logger.debug("Deleted all RemoteRealm registrations")
 
     # Lightweight creation of users, streams, and messages
     def create_user(self, skip_auditlog: bool = False, **kwargs: Any) -> UserProfile:
@@ -127,6 +133,7 @@ class AnalyticsTestCase(ZulipTestCase):
         }
         for key, value in defaults.items():
             kwargs[key] = kwargs.get(key, value)
+        logger.debug(f"Creating user with email: {kwargs['email']}")
         with time_machine.travel(kwargs["date_joined"], tick=False):
             user = create_user(
                 kwargs["email"],
@@ -160,6 +167,7 @@ class AnalyticsTestCase(ZulipTestCase):
         }
         for key, value in defaults.items():
             kwargs[key] = kwargs.get(key, value)
+        logger.debug(f"Creating stream with name: {kwargs['name']}")
         stream = Stream.objects.create(**kwargs)
         recipient = Recipient.objects.create(type_id=stream.id, type=Recipient.STREAM)
         stream.recipient = recipient
@@ -197,6 +205,7 @@ class AnalyticsTestCase(ZulipTestCase):
 
         for key, value in defaults.items():
             kwargs[key] = kwargs.get(key, value)
+        logger.debug(f"Creating message from {sender.email}")
         return Message.objects.create(**kwargs)
 
     def create_attachment(
@@ -207,6 +216,7 @@ class AnalyticsTestCase(ZulipTestCase):
         create_time: datetime,
         content_type: str,
     ) -> Attachment:
+        logger.debug(f"Creating attachment: {filename}")
         return Attachment.objects.create(
             file_name=filename,
             path_id=f"foo/bar/{filename}",
@@ -241,6 +251,7 @@ class AnalyticsTestCase(ZulipTestCase):
         row of <table>, and that no additional rows exist. Note that this means
         checking a table with duplicate rows is not supported.
         """
+        logger.debug(f"Asserting table state for {table.__name__} with {len(arg_values)} expected rows")
         defaults = {
             "property": self.current_property,
             "subgroup": None,
@@ -269,6 +280,7 @@ class AnalyticsTestCase(ZulipTestCase):
 
 class TestProcessCountStat(AnalyticsTestCase):
     def make_dummy_count_stat(self, property: str) -> CountStat:
+        logger.debug(f"Creating dummy count stat with property: {property}")
         query = lambda kwargs: SQL(
             """
             INSERT INTO analytics_realmcount (realm_id, value, property, end_time)
@@ -283,12 +295,14 @@ class TestProcessCountStat(AnalyticsTestCase):
     def assertFillStateEquals(
         self, stat: CountStat, end_time: datetime, state: int = FillState.DONE
     ) -> None:
+        logger.debug(f"Asserting fill state for stat {stat.property}: end_time={end_time}, state={state}")
         fill_state = FillState.objects.filter(property=stat.property).first()
         assert fill_state is not None
         self.assertEqual(fill_state.end_time, end_time)
         self.assertEqual(fill_state.state, state)
 
     def test_process_stat(self) -> None:
+        logger.info("Running test_process_stat")
         # process new stat
         current_time = installation_epoch() + self.HOUR
         stat = self.make_dummy_count_stat("test stat")
@@ -485,6 +499,7 @@ class TestCountStats(AnalyticsTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        logger.info("Setting up TestCountStats")
         # This tests two things for each of the queries/CountStats: Handling
         # more than 1 realm, and the time bounds (time_start and time_end in
         # the queries).
@@ -493,6 +508,7 @@ class TestCountStats(AnalyticsTestCase):
             name="Second Realm",
             date_created=self.TIME_ZERO - 2 * self.DAY,
         )
+        logger.debug(f"Created second realm: {self.second_realm.string_id}")
 
         for minutes_ago in [0, 1, 61, 60 * 24 + 1]:
             creation_time = self.TIME_ZERO - minutes_ago * self.MINUTE
@@ -507,6 +523,7 @@ class TestCountStats(AnalyticsTestCase):
             self.create_message(user, recipient, date_sent=creation_time)
         self.hourly_user = get_user_by_delivery_email("user-1@second.analytics", self.second_realm)
         self.daily_user = get_user_by_delivery_email("user-61@second.analytics", self.second_realm)
+        logger.debug("Created test users and streams in second realm")
 
         # This realm should not show up in the *Count tables for any of the
         # messages_* CountStats
@@ -515,13 +532,16 @@ class TestCountStats(AnalyticsTestCase):
             name="No Message Realm",
             date_created=self.TIME_ZERO - 2 * self.DAY,
         )
+        logger.debug(f"Created no-message realm: {self.no_message_realm.string_id}")
 
         self.create_user(realm=self.no_message_realm)
         self.create_stream_with_recipient(realm=self.no_message_realm)
         # This direct_message_group should not show up anywhere
         self.create_direct_message_group_with_recipient()
+        logger.debug("TestCountStats setup complete")
 
     def test_upload_quota_used_bytes(self) -> None:
+        logger.info("Running test_upload_quota_used_bytes")
         stat = COUNT_STATS["upload_quota_used_bytes::day"]
         self.current_property = stat.property
 
