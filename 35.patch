@@ -1,0 +1,482 @@
+diff --git a/analytics/lib/analytics_summary.py b/analytics/lib/analytics_summary.py
+new file mode 100644
+index 0000000000..46b2a0a0a0
+--- /dev/null
++++ b/analytics/lib/analytics_summary.py
+@@ -0,0 +1,301 @@
++import csv
++import io
++import json
++import logging
++from collections import OrderedDict
++from datetime import datetime, timedelta
++from typing import Any
++
++from django.db.models import Avg, Count, Max, Min, Sum
++from django.utils.timezone import now as timezone_now
++
++from analytics.lib.counts import COUNT_STATS, CountStat
++from analytics.lib.time_utils import time_range
++from analytics.models import (
++    FillState,
++    InstallationCount,
++    RealmCount,
++)
++from zerver.models import Realm
++
++logger = logging.getLogger("zulip.analytics")
++
++
++class AnalyticsSummaryError(Exception):
++    pass
++
++
++class SummaryConfig:
++    def __init__(
++        self,
++        stat_property: str,
++        realm: Realm | None = None,
++        days: int = 30,
++    ) -> None:
++        if stat_property not in COUNT_STATS:
++            raise AnalyticsSummaryError(f"Unknown stat property: {stat_property}")
++        self.stat = COUNT_STATS[stat_property]
++        self.realm = realm
++        self.days = days
++
++    @property
++    def end_time(self) -> datetime:
++        last_fill = self.stat.last_successful_fill()
++        if last_fill is not None:
++            return last_fill
++        return timezone_now()
++
++    @property
++    def start_time(self) -> datetime:
++        return self.end_time - timedelta(days=self.days)
++
++
++def get_realm_summary(
++    stat: CountStat,
++    realm: Realm,
++    start_time: datetime,
++    end_time: datetime,
++) -> dict[str, Any]:
++    queryset = RealmCount.objects.filter(
++        realm=realm,
++        property=stat.property,
++        end_time__gte=start_time,
++        end_time__lte=end_time,
++    )
++
++    aggregates = queryset.aggregate(
++        total=Sum("value"),
++        average=Avg("value"),
++        maximum=Max("value"),
++        minimum=Min("value"),
++        data_points=Count("id"),
++    )
++
++    subgroups = (
++        queryset.values_list("subgroup", flat=True)
++        .distinct()
++        .order_by("subgroup")
++    )
++    subgroup_list = [sg for sg in subgroups if sg is not None]
++
++    return {
++        "realm_id": realm.id,
++        "realm_name": realm.name,
++        "realm_string_id": realm.string_id,
++        "stat_property": stat.property,
++        "stat_frequency": stat.frequency,
++        "start_time": start_time.isoformat(),
++        "end_time": end_time.isoformat(),
++        "total": aggregates["total"] or 0,
++        "average": round(aggregates["average"] or 0, 2),
++        "maximum": aggregates["maximum"] or 0,
++        "minimum": aggregates["minimum"] or 0,
++        "data_points": aggregates["data_points"],
++        "subgroups": subgroup_list,
++    }
++
++
++def get_installation_summary(
++    stat: CountStat,
++    start_time: datetime,
++    end_time: datetime,
++) -> dict[str, Any]:
++    queryset = InstallationCount.objects.filter(
++        property=stat.property,
++        end_time__gte=start_time,
++        end_time__lte=end_time,
++    )
++
++    aggregates = queryset.aggregate(
++        total=Sum("value"),
++        average=Avg("value"),
++        maximum=Max("value"),
++        minimum=Min("value"),
++        data_points=Count("id"),
++    )
++
++    subgroups = (
++        queryset.values_list("subgroup", flat=True)
++        .distinct()
++        .order_by("subgroup")
++    )
++    subgroup_list = [sg for sg in subgroups if sg is not None]
++
++    return {
++        "stat_property": stat.property,
++        "stat_frequency": stat.frequency,
++        "start_time": start_time.isoformat(),
++        "end_time": end_time.isoformat(),
++        "total": aggregates["total"] or 0,
++        "average": round(aggregates["average"] or 0, 2),
++        "maximum": aggregates["maximum"] or 0,
++        "minimum": aggregates["minimum"] or 0,
++        "data_points": aggregates["data_points"],
++        "subgroups": subgroup_list,
++    }
++
++
++def get_fill_state_summary() -> list[dict[str, Any]]:
++    results = []
++    for property, stat in COUNT_STATS.items():
++        fill_state = FillState.objects.filter(property=property).first()
++        if fill_state is None:
++            results.append(
++                {
++                    "property": property,
++                    "frequency": stat.frequency,
++                    "last_fill_time": None,
++                    "state": "never_run",
++                }
++            )
++        else:
++            state_label = "done" if fill_state.state == FillState.DONE else "started"
++            results.append(
++                {
++                    "property": property,
++                    "frequency": stat.frequency,
++                    "last_fill_time": fill_state.end_time.isoformat(),
++                    "state": state_label,
++                }
++            )
++    return results
++
++
++def get_time_series_data(
++    stat: CountStat,
++    start_time: datetime,
++    end_time: datetime,
++    realm: Realm | None = None,
++) -> dict[str, list[dict[str, Any]]]:
++    end_times = time_range(start_time, end_time, stat.frequency, None)
++
++    if realm is not None:
++        queryset = RealmCount.objects.filter(
++            realm=realm,
++            property=stat.property,
++            end_time__in=end_times,
++        )
++    else:
++        queryset = InstallationCount.objects.filter(
++            property=stat.property,
++            end_time__in=end_times,
++        )
++
++    rows = queryset.values_list("subgroup", "end_time", "value").order_by("subgroup", "end_time")
++
++    series_by_subgroup: dict[str, list[dict[str, Any]]] = {}
++    for subgroup, end_time, value in rows:
++        key = subgroup if subgroup is not None else "total"
++        if key not in series_by_subgroup:
++            series_by_subgroup[key] = []
++        series_by_subgroup[key].append(
++            {
++                "end_time": end_time.isoformat(),
++                "value": value,
++            }
++        )
++
++    return series_by_subgroup
++
++
++def compute_growth_rate(
++    stat: CountStat,
++    start_time: datetime,
++    end_time: datetime,
++    realm: Realm | None = None,
++) -> dict[str, float | None]:
++    if realm is not None:
++        queryset = RealmCount.objects.filter(
++            realm=realm,
++            property=stat.property,
++        )
++    else:
++        queryset = InstallationCount.objects.filter(
++            property=stat.property,
++        )
++
++    midpoint = start_time + (end_time - start_time) / 2
++
++    first_half = queryset.filter(
++        end_time__gte=start_time,
++        end_time__lt=midpoint,
++    ).aggregate(total=Sum("value"))
++
++    second_half = queryset.filter(
++        end_time__gte=midpoint,
++        end_time__lte=end_time,
++    ).aggregate(total=Sum("value"))
++
++    first_total = first_half["total"] or 0
++    second_total = second_half["total"] or 0
++
++    if first_total == 0:
++        return {"growth_rate": None, "first_half_total": first_total, "second_half_total": second_total}
++
++    growth_rate = (second_total - first_total) / first_total
++    return {
++        "growth_rate": round(growth_rate, 4),
++        "first_half_total": first_total,
++        "second_half_total": second_total,
++    }
++
++
++def export_summary_as_json(summary_data: dict[str, Any] | list[dict[str, Any]]) -> str:
++    return json.dumps(summary_data, indent=2, default=str)
++
++
++def export_summary_as_csv(
++    summary_data: dict[str, Any] | list[dict[str, Any]],
++) -> str:
++    output = io.StringIO()
++    if isinstance(summary_data, list):
++        if len(summary_data) == 0:
++            return ""
++        writer = csv.DictWriter(output, fieldnames=summary_data[0].keys())
++        writer.writeheader()
++        writer.writerows(summary_data)
++    else:
++        writer = csv.DictWriter(output, fieldnames=summary_data.keys())
++        writer.writeheader()
++        writer.writerow(summary_data)
++    return output.getvalue()
++
++
++def generate_full_report(
++    realm: Realm | None = None,
++    days: int = 30,
++    stat_properties: list[str] | None = None,
++) -> OrderedDict:
++    if stat_properties is not None:
++        stats = [(p, COUNT_STATS[p]) for p in stat_properties if p in COUNT_STATS]
++    else:
++        stats = list(COUNT_STATS.items())
++
++    now = timezone_now()
++    start_time = now - timedelta(days=days)
++
++    report: OrderedDict[str, Any] = OrderedDict()
++    report["generated_at"] = now.isoformat()
++    report["period_days"] = days
++    report["start_time"] = start_time.isoformat()
++    report["end_time"] = now.isoformat()
++
++    fill_state_summary = get_fill_state_summary()
++    report["fill_state_summary"] = fill_state_summary
++
++    stat_summaries: list[dict[str, Any]] = []
++    for property, stat in stats:
++        last_fill = stat.last_successful_fill()
++        effective_end = last_fill if last_fill is not None else now
++
++        if realm is not None:
++            summary = get_realm_summary(stat, realm, start_time, effective_end)
++        else:
++            summary = get_installation_summary(stat, start_time, effective_end)
++
++        growth = compute_growth_rate(stat, start_time, effective_end, realm)
++        summary["growth"] = growth
++        stat_summaries.append(summary)
++
++    report["stat_summaries"] = stat_summaries
++    return report
+diff --git a/analytics/management/commands/export_analytics_summary.py b/analytics/management/commands/export_analytics_summary.py
+new file mode 100644
+index 0000000000..f33020ab9f
+--- /dev/null
++++ b/analytics/management/commands/export_analytics_summary.py
+@@ -0,0 +1,169 @@
++import sys
++from argparse import ArgumentParser
++from typing import Any
++
++from typing_extensions import override
++
++from analytics.lib.analytics_summary import (
++    AnalyticsSummaryError,
++    compute_growth_rate,
++    export_summary_as_csv,
++    export_summary_as_json,
++    generate_full_report,
++    get_fill_state_summary,
++    get_time_series_data,
++)
++from analytics.lib.counts import COUNT_STATS
++from zerver.lib.management import ZulipBaseCommand
++from zerver.models import Realm
++
++
++class Command(ZulipBaseCommand):
++    help = """Export analytics summary data.
++
++    Generates summary reports of analytics statistics, including
++    aggregate values, growth rates, and fill state information.
++    Supports JSON and CSV output formats."""
++
++    @override
++    def add_arguments(self, parser: ArgumentParser) -> None:
++        parser.add_argument(
++            "--format",
++            "-f",
++            choices=["json", "csv"],
++            default="json",
++            help="Output format (default: json).",
++        )
++        parser.add_argument(
++            "--days",
++            "-d",
++            type=int,
++            default=30,
++            help="Number of days to include in the summary (default: 30).",
++        )
++        parser.add_argument(
++            "--stat",
++            "-s",
++            action="append",
++            dest="stats",
++            help="Specific stat property to include. Can be repeated. If omitted, all stats are included.",
++        )
++        parser.add_argument(
++            "--realm",
++            "-r",
++            help="Realm string_id to filter by. If omitted, installation-wide data is used.",
++        )
++        parser.add_argument(
++            "--fill-state",
++            action="store_true",
++            help="Only output the fill state summary for all stats.",
++        )
++        parser.add_argument(
++            "--growth",
++            action="store_true",
++            help="Include growth rate analysis in the output.",
++        )
++        parser.add_argument(
++            "--time-series",
++            action="store_true",
++            help="Include time series data in the output.",
++        )
++        parser.add_argument(
++            "--output",
++            "-o",
++            help="Write output to a file instead of stdout.",
++        )
++
++    @override
++    def handle(self, *args: Any, **options: Any) -> None:
++        try:
++            self.run_export(options)
++        except AnalyticsSummaryError as e:
++            self.stderr.write(self.style.ERROR(str(e)))
++            sys.exit(1)
++
++    def run_export(self, options: dict[str, Any]) -> None:
++        realm = None
++        if options["realm"] is not None:
++            try:
++                realm = Realm.objects.get(string_id=options["realm"])
++            except Realm.DoesNotExist:
++                raise AnalyticsSummaryError(f'Realm "{options["realm"]}" does not exist.')
++
++        stat_properties = options["stats"]
++        if stat_properties is not None:
++            for prop in stat_properties:
++                if prop not in COUNT_STATS:
++                    raise AnalyticsSummaryError(f'Unknown stat property: "{prop}"')
++
++        days = options["days"]
++        if days <= 0:
++            raise AnalyticsSummaryError("--days must be a positive integer.")
++
++        if options["fill_state"]:
++            result = get_fill_state_summary()
++        elif options["time_series"] and stat_properties is not None:
++            result = self._get_time_series_output(realm, days, stat_properties)
++        elif options["growth"] and stat_properties is not None:
++            result = self._get_growth_output(realm, days, stat_properties)
++        else:
++            result = generate_full_report(
++                realm=realm,
++                days=days,
++                stat_properties=stat_properties,
++            )
++
++        output_format = options["format"]
++        if output_format == "json":
++            output = export_summary_as_json(result)
++        else:
++            output = export_summary_as_csv(result)
++
++        if options["output"] is not None:
++            with open(options["output"], "w") as f:
++                f.write(output)
++            self.stdout.write(self.style.SUCCESS(f"Summary written to {options['output']}"))
++        else:
++            self.stdout.write(output)
++
++    def _get_time_series_output(
++        self,
++        realm: Realm | None,
++        days: int,
++        stat_properties: list[str],
++    ) -> dict[str, Any]:
++        from django.utils.timezone import now as timezone_now
++        from datetime import timedelta
++
++        now = timezone_now()
++        start_time = now - timedelta(days=days)
++        result: dict[str, Any] = {"generated_at": now.isoformat(), "period_days": days}
++
++        for prop in stat_properties:
++            stat = COUNT_STATS[prop]
++            last_fill = stat.last_successful_fill()
++            effective_end = last_fill if last_fill is not None else now
++            result[prop] = get_time_series_data(stat, start_time, effective_end, realm)
++
++        return result
++
++    def _get_growth_output(
++        self,
++        realm: Realm | None,
++        days: int,
++        stat_properties: list[str],
++    ) -> dict[str, Any]:
++        from django.utils.timezone import now as timezone_now
++        from datetime import timedelta
++
++        now = timezone_now()
++        start_time = now - timedelta(days=days)
++        result: dict[str, Any] = {"generated_at": now.isoformat(), "period_days": days}
++
++        for prop in stat_properties:
++            stat = COUNT_STATS[prop]
++            last_fill = stat.last_successful_fill()
++            effective_end = last_fill if last_fill is not None else now
++            result[prop] = compute_growth_rate(stat, start_time, effective_end, realm)
++
++        return result
